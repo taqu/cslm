@@ -4,6 +4,7 @@ using cslm;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -73,6 +74,16 @@ namespace cslm
             }
         }
 
+        public int num_tensors()
+        {
+            return tensors_.Count;
+        }
+
+        public Tensor get_tensor(int index)
+        {
+            return tensors_[index];
+        }
+
         public int find(string name, int layer)
         {
             name = string.Format(name, layer);
@@ -104,6 +115,11 @@ namespace cslm
             return index;
         }
 
+        public int num_metadata()
+        {
+            return metadata_.Count;
+        }
+
         public int find_metadata(string key)
         {
             for (int i = 0; i < metadata_.Count; ++i)
@@ -116,21 +132,26 @@ namespace cslm
             return -1;
         }
 
-        public string get_metadata_value(int index)
+		public string get_metadata_key(int index)
+		{
+            return metadata_[index].key_;
+		}
+
+		public string get_metadata_value(int index)
         {
             long offset = metadata_[index].value_;
             int length = 0;
-            while (data_[offset] != 0)
+            while (data_[offset + length] != 0)
             {
                 ++length;
-                ++offset;
             }
-            return Encoding.ASCII.GetString(data_, (int)offset, length);
+            string value = Encoding.ASCII.GetString(data_, (int)offset, length);
+            return value;
         }
 
         private class JsonParser
         {
-            private const int BufferSize = 1024;
+            private const int BufferSize = 256;
             private byte[] buffer_ = new byte[BufferSize];
 
             public long json_skipws(long offset, byte[] data)
@@ -189,26 +210,22 @@ namespace cslm
 
             private long strtoll(ref long offset, byte[] data)
             {
-                long length = Math.Min(data.LongLength - offset, BufferSize);
+                int length = 0;
+                for(long i=offset; i<data.LongLength; ++i)
+                {
+                    if (data[i] != '+' && data[i] != '-' && !char.IsAsciiDigit((char)data[i]))
+                    {
+                        break;
+                    }
+                    ++length;
+                }
+				length = Math.Min(length, BufferSize);
                 System.Array.Copy(data, offset, buffer_, 0, length);
-                string str = Encoding.ASCII.GetString(buffer_);
+                string str = Encoding.ASCII.GetString(buffer_, 0, length);
                 long value;
                 if (long.TryParse(str, out value))
                 {
-                    int i = 0;
-                    if (str[0] == '+' || str[0] == '-')
-                    {
-                        ++i;
-                        offset += 1;
-                    }
-                    for (; i < str.Length; ++i)
-                    {
-                        if (!char.IsDigit(str[i]))
-                        {
-                            break;
-                        }
-                        ++offset;
-                    }
+                    offset += length;
                 }
                 return value;
             }
