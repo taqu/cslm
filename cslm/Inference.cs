@@ -249,7 +249,7 @@ namespace cslm
             int dbits = transformer.weights_.dbits_;
 
             // copy the token embedding into x
-            Span<byte> content_row = transformer.weights_.token_embedding_table_.AsSpan<byte>(token * dim * (dbits / 8));
+            Span<byte> content_row = transformer.weights_.AsSpan<byte>(transformer.weights_.token_embedding_table_, token * dim * (dbits / 8));
             if (4 == dbits)
             {
                 Span<uint> content_row_u32 = MemoryMarshal.Cast<byte, uint>(content_row);
@@ -285,17 +285,16 @@ namespace cslm
             for (int l = 0; l < transformer.config_.n_layers_; ++l)
             {
                 // attention rmsnorm
-                Span2D<float> rms_att_weight = transformer.weights_.rms_att_weight_;
-                rms_att_weight.GetRowSpan(l);
+                Span<float> rms_att_weight = transformer.weights_.AsSpan<float>(transformer.weights_.rms_att_weight_[l]);
 
-                rmsnorm(transformer.state_.xb_, x, rms_att_weight.GetRowSpan(l), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
+                rmsnorm(transformer.state_.xb_, x, rms_att_weight, dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
 
                 // qkv matmuls for this position
-                Span<byte> wq = transformer.weights_.wq_.GetRowSpan(l);
-                Span<byte> wk = transformer.weights_.wk_.GetRowSpan(l);
-                Span<byte> wv = transformer.weights_.wv_.GetRowSpan(l);
+                Span<byte> wq = transformer.weights_.AsSpan<byte>(transformer.weights_.wq_[l]);
+                Span<byte> wk = transformer.weights_.AsSpan<byte>(transformer.weights_.wk_[l]);
+                Span<byte> wv = transformer.weights_.AsSpan<byte>(transformer.weights_.wv_[l]);
                 int bqkv_len = transformer.weights_.bqkv_.Length;
-                Span<float> bqkv = 0 < bqkv_len ? transformer.weights_.bqkv_.GetRowSpan(l) : new Span<float>();
+                Span<float> bqkv = 0 < bqkv_len ? transformer.weights_.AsSpan<float>(transformer.weights_.bqkv_[l]) : empty_span;
                 matmul(transformer.state_.q_, transformer.state_.xb_, wq, bqkv, dim, q_dim, dotprod);
                 bqkv = 0 < bqkv_len ? bqkv.Slice(q_dim) : empty_span;
                 matmul(transformer.state_.k_, transformer.state_.xb_, wk, bqkv, dim, kv_dim, dotprod);
@@ -358,7 +357,7 @@ namespace cslm
 
                 // final matmul to get the output of the attention
                 // TODO: we're using hb as a temporary storage, hacky
-                matmul(transformer.state_.hb_, transformer.state_.xb2_, transformer.weights_.wo_.GetRowSpan(l), empty_span, q_dim, dim, dotprod);
+                matmul(transformer.state_.hb_, transformer.state_.xb2_, transformer.weights_.AsSpan<byte>(transformer.weights_.wo_[l]), empty_span, q_dim, dim, dotprod);
 
                 // residual connection back into x
                 for (int i = 0; i < dim; ++i)
@@ -369,7 +368,7 @@ namespace cslm
                 if (!transformer.config_.norm_par_)
                 {
                     // ffn rmsnorm
-                    rmsnorm(transformer.state_.xb_, x, transformer.weights_.rms_ffn_weight_.GetRowSpan(l), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
+                    rmsnorm(transformer.state_.xb_, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_ffn_weight_[l]), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
                 }
 
                 Span<float> moe_weights = transformer.state_.exp_.AsSpan(transformer.config_.n_experts_);
@@ -378,7 +377,7 @@ namespace cslm
                 if (0 != transformer.config_.n_experts_)
                 {
                     // moe gate
-                    matmul(transformer.state_.exp_, transformer.state_.xb_, transformer.weights_.moegate_.GetRowSpan(l), empty_span, dim, transformer.config_.n_experts_, dotprod);
+                    matmul(transformer.state_.exp_, transformer.state_.xb_, transformer.weights_.AsSpan<byte>(transformer.weights_.moegate_[l]), empty_span, dim, transformer.config_.n_experts_, dotprod);
                     moe_gate(moe_weights, moe_experts, transformer.state_.exp_, transformer.config_.n_experts_, transformer.config_.n_experts_ac_);
                 }
                 else
@@ -391,8 +390,8 @@ namespace cslm
                 for (int e = 0; e < (0 != transformer.config_.n_experts_ac_ ? transformer.config_.n_experts_ac_ : 1); ++e)
                 {
                     int esize = dim * hidden_dim * (transformer.weights_.dbits_ / 8);
-                    matmul(transformer.state_.hb_, transformer.state_.xb_, transformer.weights_.w1_.GetRowSpan(l).Slice(moe_experts[e] * esize), empty_span, dim, hidden_dim, dotprod);
-                    matmul(transformer.state_.hb2_, transformer.state_.xb_, transformer.weights_.w3_.GetRowSpan(l).Slice(moe_experts[e] * esize), empty_span, dim, hidden_dim, dotprod);
+                    matmul(transformer.state_.hb_, transformer.state_.xb_, transformer.weights_.AsSpan<byte>(transformer.weights_.w1_[l]).Slice(moe_experts[e] * esize), empty_span, dim, hidden_dim, dotprod);
+                    matmul(transformer.state_.hb2_, transformer.state_.xb_, transformer.weights_.AsSpan<byte>(transformer.weights_.w3_[l]).Slice(moe_experts[e] * esize), empty_span, dim, hidden_dim, dotprod);
 
                     if (transformer.config_.act_gelu_)
                     {
@@ -411,7 +410,7 @@ namespace cslm
                         }
                     }
 
-                    matmul(transformer.state_.xb2_, transformer.state_.hb_, transformer.weights_.w2_.GetRowSpan(l).Slice(moe_experts[e] * esize), empty_span, hidden_dim, dim, dotprod);
+                    matmul(transformer.state_.xb2_, transformer.state_.hb_, transformer.weights_.AsSpan<byte>(transformer.weights_.w2_[l]).Slice(moe_experts[e] * esize), empty_span, hidden_dim, dim, dotprod);
 
                     for (int i = 0; i < dim; ++i)
                     {
@@ -427,10 +426,10 @@ namespace cslm
 
 
             // final rmsnorm
-            rmsnorm(x, x, transformer.weights_.rms_final_weight_, dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
+            rmsnorm(x, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_final_weight_), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
 
             // classifier into logits
-            matmul(transformer.state_.logits_, x, transformer.weights_.wcls_, empty_span, transformer.config_.dim_, transformer.config_.vocab_size_, dotprod);
+            matmul(transformer.state_.logits_, x, transformer.weights_.AsSpan<byte>(transformer.weights_.wcls_), empty_span, transformer.config_.dim_, transformer.config_.vocab_size_, dotprod);
 
             return transformer.state_.logits_;
         }

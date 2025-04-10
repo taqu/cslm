@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
@@ -48,8 +49,10 @@ namespace cslm
     public class Tensors
     {
         private long size_;
-        private byte[]? data_;
-        private List<Metadata> metadata_ = new List<Metadata>();
+		private long byte_offset_;
+		private long byte_size_;
+		private byte[]? data_;
+		private List<Metadata> metadata_ = new List<Metadata>();
         private List<Tensor> tensors_ = new List<Tensor>();
 
         public Tensor this[int index]
@@ -84,7 +87,11 @@ namespace cslm
             return tensors_[index];
         }
 
-        public int find(string name, int layer)
+		public Tensor get_tensor(string name)
+		{
+			return tensors_[find(name, 0)];
+		}
+		public int find(string name, int layer)
         {
             name = string.Format(name, layer);
             for(int i=0; i<tensors_.Count; ++i)
@@ -115,7 +122,19 @@ namespace cslm
             return index;
         }
 
-        public int num_metadata()
+        public ReadOnlySpan<T> as_span<T>(string name) where T : struct
+        {
+			for (int i = 0; i < tensors_.Count; ++i)
+			{
+				if (tensors_[i].name_ == name)
+				{
+                    return MemoryMarshal.Cast<byte, T>(data_.AsSpan<byte>((int)(tensors_[i].data_ + byte_offset_), (int)tensors_[i].size_));
+				}
+			}
+            return new ReadOnlySpan<T>(); ;
+		}
+
+		public int num_metadata()
         {
             return metadata_.Count;
         }
@@ -137,8 +156,13 @@ namespace cslm
             return metadata_[index].key_;
 		}
 
-		public string get_metadata_value(int index)
+        public string get_metadata_value(int index)
         {
+            if (index < 0)
+            {
+                return string.Empty;
+            }
+
             long offset = metadata_[index].value_;
             int length = 0;
             while (data_[offset + length] != 0)
@@ -149,7 +173,37 @@ namespace cslm
             return value;
         }
 
-        private class JsonParser
+        public int get_metadata_int(string key, int default_value)
+        {
+            int index = find_metadata(key);
+            if (index < 0)
+            {
+                return default_value;
+            }
+            int value;
+            if (int.TryParse(get_metadata_value(index), out value))
+            {
+                return value;
+            }
+            return default_value;
+		}
+
+		public float get_metadata_float(string key, float default_value)
+		{
+			int index = find_metadata(key);
+			if (index < 0)
+			{
+				return default_value;
+			}
+			float value;
+			if (float.TryParse(get_metadata_value(index), out value))
+			{
+				return value;
+			}
+			return default_value;
+		}
+
+		private class JsonParser
         {
             private const int BufferSize = 256;
             private byte[] buffer_ = new byte[BufferSize];
@@ -525,7 +579,9 @@ namespace cslm
                 }
                 tensors.size_ = input.LongLength;
                 tensors.data_ = input;
-                return tensors;
+                tensors.byte_offset_ = json_end;
+                tensors.byte_size_ = bytes_size;
+				return tensors;
             }
         }
     }
