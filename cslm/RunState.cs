@@ -44,6 +44,6 @@ namespace cslm
             long cache_size = (long)config.n_layers_ * config.seq_len_ * kv_dim * sizeof(short);
             key_cache_ = new byte[cache_size];
             value_cache_ = new byte[cache_size];
-        }
-    }
+		}
+	}
 }

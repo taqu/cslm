@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "cslm.run": {
+      "commandName": "Project",
+      "commandLineArgs": "tinyllm.calm",
+      "workingDirectory": "D:\\Projects\\cslm"
+    }
+  }
+}

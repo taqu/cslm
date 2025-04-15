@@ -1,4 +1,3 @@
-using NuGet.Frameworks;
 using System.Diagnostics;
 using System.Text;
 
@@ -32,11 +31,14 @@ namespace cslm.test
             model.transformer_ = new Transformer();
 			model.get_config(2048);
             model.get_tokenizer();
+            model.get_weights();
 			Assert.True(model.tokenizer_.check_vocab());
-            string str = "ﾜｶﾞﾊｲは㈱である.吾輩は猫である。名前はまだない。";
-            List<ushort> tokens = new List<ushort>();
+            string str = "ﾜｶﾞﾊｲは㈱である.吾輩は猫である。名前はまだない。<s></s>";
+
+			List<ushort> tokens = new List<ushort>();
 			int num_tokens = model.tokenizer_.encode(tokens, Encoding.UTF8.GetBytes(str));
             string decoded = model.tokenizer_.decode(tokens);
+			Assert.AreEqual(decoded, str);
 		}
 	}
 }

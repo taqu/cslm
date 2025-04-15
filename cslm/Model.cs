@@ -1,15 +1,99 @@
-
-using cslm;
-using static cslm.Weights;
-using static System.Formats.Asn1.AsnWriter;
+using System.IO;
+using System.Reflection;
+using static System.Net.WebRequestMethods;
+using System.Xml.Linq;
 
 namespace cslm
 {
 	public struct Model
 	{
+		public Options options_;
 		public Tensors tensors_;
 		public Transformer transformer_;
 		public Tokenizer tokenizer_;
+
+		public bool initialize(Options options)
+		{
+			options_ = options;
+			tensors_ = Tensors.OpenAsync(options_.model_).Result;
+			if (null == tensors_)
+			{
+				return false;
+			}
+			transformer_ = new Transformer();
+			get_config(2048);
+			get_tokenizer();
+			get_weights();
+			if (!tokenizer_.check_vocab())
+			{
+				return false;
+			}
+			ulong dummy;
+			transformer_.n_bytes_ = count_bytes(tensors_, "model.", null, out transformer_.n_params_);
+			transformer_.n_bandwidth_ = transformer_.n_bytes_ - count_bytes(tensors_, "model.embed.", null, out dummy);
+
+			int index;
+			if (tensors_.find("model.output.weight", 0, out index))
+			{
+				transformer_.n_bandwidth_ += (ulong)tensors_.get_tensor(index).size_;
+			}
+			if (0 < transformer_.config_.n_experts_)
+			{
+				ulong mlp = count_bytes(tensors_, "model.layers.", ".mlp.w", out dummy);
+				transformer_.n_bandwidth_ -= mlp;
+				transformer_.n_bandwidth_ += mlp / (ulong)(transformer_.config_.n_experts_ * transformer_.config_.n_experts_ac_);
+			}
+
+			transformer_.state_.kvbits_ = 16;
+			transformer_.state_.Initialize(transformer_.config_);
+			transformer_.forward_ = Inference.forward;
+			transformer_.forward_(transformer_, 0, 0, 0);
+			return true;
+		}
+
+		private static ulong count_bytes(Tensors tensors, string prefix, string? filter, out ulong out_params)
+		{
+			ulong bytes = 0;
+			ulong nparams = 0;
+			var fn = (Tensor tensor, int elts) =>
+			{
+				if (0 != tensor.shape0_)
+				{
+					elts *= tensor.shape0_;
+				}
+				if (0 != tensor.shape1_)
+				{
+					elts *= tensor.shape1_;
+				}
+				if (0 != tensor.shape2_)
+				{
+					elts *= tensor.shape2_;
+				}
+				if (0 != tensor.shape3_)
+				{
+					elts *= tensor.shape3_;
+				}
+				return elts;
+			};
+			for (int i = 0; i < tensors.num_tensors(); ++i)
+			{
+				Tensor tensor = tensors[i];
+				if (!tensor.name_.StartsWith(prefix))
+				{
+					continue;
+				}
+				if (!string.IsNullOrEmpty(filter) && tensor.name_.Contains(filter))
+				{
+					continue;
+				}
+
+				int elts = tensor.dtype_ == DType.dt_i32 ? 8 : 1; // gsize hack for gf4
+				nparams += (ulong)fn(tensor, elts);
+				bytes += (ulong)tensor.size_;
+			}
+			out_params = nparams;
+			return bytes;
+		}
 
 		public void get_config(int context)
 		{
@@ -47,61 +131,98 @@ namespace cslm
 		}
 
 		public void get_weights()
+		{
+			transformer_.weights_.bytes_ = tensors_.Bytes;
+			DType wtype;
+			int gsize;
 			{
-#if false
-			const char* dtype = tensors_metadata(tensors, "dtype");
+				string type = tensors_.get_metadata_str("dtype", "gf16");
+				switch (type)
+				{
+					case "gf4":
+						wtype = DType.dt_i32;
+						gsize = 8;
+						transformer_.weights_.dbits_ = 4;
+						break;
+					case "fp8":
+						wtype = DType.dt_f8e5m2;
+						gsize = 1;
+						transformer_.weights_.dbits_ = 8;
+						break;
+					default:
+						wtype = DType.dt_f16;
+						gsize = 1;
+						transformer_.weights_.dbits_ = 16;
+						break;
 
-		enum DType wtype = strcmp(dtype, "gf4") == 0 ? dt_i32 : (strcmp(dtype, "fp8") == 0 ? dt_f8e5m2 : dt_f16);
-	int gsize = strcmp(dtype, "gf4") == 0 ? 8 : 1;
+				}
+			}
+			transformer_.weights_.token_embedding_table_ = tensors_.get_tensor("model.embed.weight", 0, wtype, transformer_.config_.vocab_size_, transformer_.config_.dim_ / gsize, 0, 0);
 
-		weights->dbits = strcmp(dtype, "gf4") == 0 ? 4 : (strcmp(dtype, "fp8") == 0 ? 8 : 16);
+			transformer_.weights_.rms_att_weight_ = new Tensor[transformer_.config_.n_layers_];
+			if (!transformer_.config_.norm_par_)
+			{
+				transformer_.weights_.rms_ffn_weight_ = new Tensor[transformer_.config_.n_layers_];
+			}
+			transformer_.weights_.wq_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.wk_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.wv_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.wo_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.w1_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.w2_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.w3_ = new Tensor[transformer_.config_.n_layers_];
+			transformer_.weights_.bqkv_ = new Tensor[transformer_.config_.n_layers_];
+			if (0 < transformer_.config_.n_experts_)
+			{
+				transformer_.weights_.moegate_ = new Tensor[transformer_.config_.n_layers_];
+			}
 
-	weights->token_embedding_table = tensors_get(tensors, "model.embed.weight", 0, wtype, (int[]){ config->vocab_size, config->dim / gsize, 0, 0});
+			int layer_dim0 = transformer_.config_.n_heads_ * transformer_.config_.head_dim_;
+			int layer_dim1 = transformer_.config_.dim_ / gsize;
+			for (int l = 0; l < transformer_.config_.n_layers_; ++l)
+			{
+				transformer_.weights_.rms_att_weight_[l] = tensors_.get_tensor("model.layers.{0}.attn.norm.weight", l, DType.dt_f32, transformer_.config_.dim_, 0, 0, 0);
 
-	for (int l = 0; l<config->n_layers; ++l) {
-		weights->rms_att_weight[l] = (float*) tensors_get(tensors, "model.layers.%d.attn.norm.weight", l, dt_f32, (int[]){ config->dim, 0, 0, 0});
+				if (!transformer_.config_.norm_par_)
+				{
+					transformer_.weights_.rms_ffn_weight_[l] = tensors_.get_tensor("model.layers.{0}.mlp.norm.weight", l, DType.dt_f32, transformer_.config_.dim_, 0, 0, 0);
+				}
+				transformer_.weights_.wq_[l] = tensors_.get_tensor("model.layers.{0}.attn.wq.weight", l, wtype, transformer_.config_.n_heads_ * transformer_.config_.head_dim_, layer_dim1, 0, 0);
+				transformer_.weights_.wk_[l] = tensors_.get_tensor("model.layers.{0}.attn.wk.weight", l, wtype, transformer_.config_.n_kv_heads_ * transformer_.config_.head_dim_, layer_dim1, 0, 0);
+				transformer_.weights_.wv_[l] = tensors_.get_tensor("model.layers.{0}.attn.wv.weight", l, wtype, transformer_.config_.n_kv_heads_ * transformer_.config_.head_dim_, layer_dim1, 0, 0);
+				transformer_.weights_.wo_[l] = tensors_.get_tensor("model.layers.{0}.attn.wo.weight", l, wtype, transformer_.config_.dim_, layer_dim1, 0, 0);
+				if (0 <= tensors_.find("model.layers.{0}.attn.wqkv.bias", l))
+				{
+					transformer_.weights_.bqkv_[l] = tensors_.get_tensor("model.layers.{0}.attn.wqkv.bias", l, DType.dt_f32, (transformer_.config_.n_heads_ + transformer_.config_.n_kv_heads_ * 2) * transformer_.config_.head_dim_, 0, 0, 0);
+				}
 
-		if (!config->norm_par) {
-			weights->rms_ffn_weight[l] = (float*) tensors_get(tensors, "model.layers.%d.mlp.norm.weight", l, dt_f32, (int[]){ config->dim, 0, 0, 0});
+				if (0 < transformer_.config_.n_experts_)
+				{
+					transformer_.weights_.moegate_[l] = tensors_.get_tensor("model.layers.{0}.moegate.weight", l, wtype, transformer_.config_.n_experts_, transformer_.config_.dim_ / gsize, 0, 0);
+
+					transformer_.weights_.w1_[l] = tensors_.get_tensor("model.layers.{0}.mlp.w1.weight", l, wtype, transformer_.config_.n_experts_, transformer_.config_.hidden_dim_, transformer_.config_.dim_ / gsize, 0);
+					transformer_.weights_.w2_[l] = tensors_.get_tensor("model.layers.{0}.mlp.w2.weight", l, wtype, transformer_.config_.n_experts_, transformer_.config_.dim_, transformer_.config_.hidden_dim_ / gsize, 0);
+					transformer_.weights_.w3_[l] = tensors_.get_tensor("model.layers.{0}.mlp.w3.weight", l, wtype, transformer_.config_.n_experts_, transformer_.config_.hidden_dim_, transformer_.config_.dim_ / gsize, 0);
+				}
+				else
+				{
+					transformer_.weights_.w1_[l] = tensors_.get_tensor("model.layers.{0}.mlp.w1.weight", l, wtype, transformer_.config_.hidden_dim_, transformer_.config_.dim_ / gsize, 0, 0);
+					transformer_.weights_.w2_[l] = tensors_.get_tensor("model.layers.{0}.mlp.w2.weight", l, wtype, transformer_.config_.dim_, transformer_.config_.hidden_dim_ / gsize, 0, 0);
+					transformer_.weights_.w3_[l] = tensors_.get_tensor("model.layers.{0}.mlp.w3.weight", l, wtype, transformer_.config_.hidden_dim_, transformer_.config_.dim_ / gsize, 0, 0);
+				}
+			}
+
+			transformer_.weights_.rms_final_weight_ = tensors_.get_tensor("model.norm.weight", 0, DType.dt_f32, transformer_.config_.dim_, 0, 0, 0);
+
+			if (0 < tensors_.find("model.output.weight", 0))
+			{
+				transformer_.weights_.wcls_ = transformer_.weights_.token_embedding_table_; // tied weights
+			}
+			else
+			{
+				transformer_.weights_.wcls_ = tensors_.get_tensor("model.output.weight", 0, wtype, transformer_.config_.vocab_size_, transformer_.config_.dim_ / gsize, 0, 0);
+			}
 		}
-
-	weights->wq[l] = tensors_get(tensors, "model.layers.%d.attn.wq.weight", l, wtype, (int[]){ config->n_heads * config->head_dim, config->dim / gsize, 0, 0});
-		weights->wk[l] = tensors_get(tensors, "model.layers.%d.attn.wk.weight", l, wtype, (int[]){ config->n_kv_heads * config->head_dim, config->dim / gsize, 0, 0});
-		weights->wv[l] = tensors_get(tensors, "model.layers.%d.attn.wv.weight", l, wtype, (int[]){ config->n_kv_heads * config->head_dim, config->dim / gsize, 0, 0});
-		weights->wo[l] = tensors_get(tensors, "model.layers.%d.attn.wo.weight", l, wtype, (int[]){ config->dim, config->n_heads * config->head_dim / gsize, 0, 0});
-
-		if (tensors_find(tensors, "model.layers.%d.attn.wqkv.bias", l)) {
-			weights->bqkv[l] = (float*) tensors_get(tensors, "model.layers.%d.attn.wqkv.bias", l, dt_f32, (int[]){ (config->n_heads + config->n_kv_heads * 2) * config->head_dim, 0, 0, 0});
-		}
-
-if (config->n_experts)
-{
-	weights->moegate[l] = tensors_get(tensors, "model.layers.%d.moegate.weight", l, wtype, (int[]){ config->n_experts, config->dim / gsize, 0, 0});
-
-	weights->w1[l] = tensors_get(tensors, "model.layers.%d.mlp.w1.weight", l, wtype, (int[]){ config->n_experts, config->hidden_dim, config->dim / gsize, 0});
-	weights->w2[l] = tensors_get(tensors, "model.layers.%d.mlp.w2.weight", l, wtype, (int[]){ config->n_experts, config->dim, config->hidden_dim / gsize, 0});
-	weights->w3[l] = tensors_get(tensors, "model.layers.%d.mlp.w3.weight", l, wtype, (int[]){ config->n_experts, config->hidden_dim, config->dim / gsize, 0});
-}
-else
-{
-	weights->w1[l] = tensors_get(tensors, "model.layers.%d.mlp.w1.weight", l, wtype, (int[]){ config->hidden_dim, config->dim / gsize, 0, 0});
-	weights->w2[l] = tensors_get(tensors, "model.layers.%d.mlp.w2.weight", l, wtype, (int[]){ config->dim, config->hidden_dim / gsize, 0, 0});
-	weights->w3[l] = tensors_get(tensors, "model.layers.%d.mlp.w3.weight", l, wtype, (int[]){ config->hidden_dim, config->dim / gsize, 0, 0});
-}
-	}
-
-	weights->rms_final_weight = (float*)tensors_get(tensors, "model.norm.weight", 0, dt_f32, (int[]){ config->dim, 0, 0, 0});
-
-if (tensors_find(tensors, "model.output.weight", 0) == NULL)
-{
-	weights->wcls = weights->token_embedding_table; // tied weights
-}
-else
-{
-	weights->wcls = tensors_get(tensors, "model.output.weight", 0, wtype, (int[]){ config->vocab_size, config->dim / gsize, 0, 0});
-}
-#endif
-}
 
 		public void get_tokenizer()
 		{

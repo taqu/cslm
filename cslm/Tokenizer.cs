@@ -28,7 +28,7 @@ namespace cslm
 
 	public class Tokenizer
 	{
-		private const int MAX_TOKEN_LENGTH = 512;
+		private const int MAX_TOKEN_LENGTH = 64;
 		private byte[] tokens_;
 		private Vocab[] vocab_;
 		private float[] scores_;
@@ -134,7 +134,7 @@ namespace cslm
 			Debug.Assert(vocab_size < ushort.MaxValue);
 			Tokenizer tokenizer = new Tokenizer();
 			tokenizer.vocab_size_ = (ushort)vocab_size;
-			tokenizer.bos_id_ = (0<= bos_id)? (ushort)bos_id : ushort.MaxValue;
+			tokenizer.bos_id_ = (0 <= bos_id) ? (ushort)bos_id : ushort.MaxValue;
 			tokenizer.eos_id_ = (0 <= eos_id) ? (ushort)eos_id : ushort.MaxValue;
 			tokenizer.eot_id_ = ushort.MaxValue;
 
@@ -173,20 +173,20 @@ namespace cslm
 				}
 			}
 
-			if (ushort.MaxValue<=tokenizer.eot_id_)
+			if (ushort.MaxValue <= tokenizer.eot_id_)
 			{
 				int id = tokenizer.str_lookup("<|eot_id|>");
-				tokenizer.eot_id_ = 0<=id? (ushort)id : ushort.MaxValue;
+				tokenizer.eot_id_ = 0 <= id ? (ushort)id : ushort.MaxValue;
 			}
 			if (ushort.MaxValue <= tokenizer.eot_id_)
 			{
 				int id = tokenizer.str_lookup("<|end|>");
-					tokenizer.eot_id_ = 0 <= id ? (ushort)id : ushort.MaxValue;
+				tokenizer.eot_id_ = 0 <= id ? (ushort)id : ushort.MaxValue;
 			}
 			if (ushort.MaxValue <= tokenizer.eot_id_)
 			{
 				int id = tokenizer.str_lookup("<|im_end|>");
-					tokenizer.eot_id_ = 0 <= id ? (ushort)id : ushort.MaxValue;
+				tokenizer.eot_id_ = 0 <= id ? (ushort)id : ushort.MaxValue;
 			}
 			return tokenizer;
 		}
@@ -206,7 +206,7 @@ namespace cslm
 				piece = piece.Slice(1);
 			}
 			// return byte piece for byte fallback tokens (<0x00>, <0x01>, etc.)
-			if (0 <= byte_fallbacks_ && (token - byte_fallbacks_) < 256)
+			if (0 <= byte_fallbacks_ && (uint)(token - byte_fallbacks_) < 256)
 			{
 				piece = byte_pieces_[token - byte_fallbacks_];
 			}
@@ -221,7 +221,7 @@ namespace cslm
 			}
 			List<byte> bytes = new List<byte>(1024);
 			bytes.AddRange(decode(tokens[0], tokens[0]));
-			for(int i=1; i< tokens.Count; ++i)
+			for (int i = 1; i < tokens.Count; ++i)
 			{
 				bytes.AddRange(decode(tokens[i - 1], tokens[i]));
 			}
@@ -351,7 +351,7 @@ namespace cslm
 				// we might have new pairs to merge
 				for (int i = merge.lpos_ - 1; 0 <= i; --i)
 				{
-					if (tokens[i] != uint.MaxValue)
+					if (tokens[i] != ushort.MaxValue)
 					{
 						n_heap = merge_tokens_tryadd(heap, n_heap, i, tokens[i], merge.lpos_, merge.resid_);
 						break;
@@ -360,7 +360,7 @@ namespace cslm
 
 				for (int i = merge.rpos_ + 1; i < tokens.Count; ++i)
 				{
-					if (tokens[i] != uint.MaxValue)
+					if (tokens[i] != ushort.MaxValue)
 					{
 						n_heap = merge_tokens_tryadd(heap, n_heap, merge.lpos_, merge.resid_, i, tokens[i]);
 						break;
@@ -377,13 +377,11 @@ namespace cslm
 					tokens[num_tokens++] = tokens[i];
 				}
 			}
-			tokens.RemoveRange(num_tokens, tokens.Count- num_tokens);
+			tokens.RemoveRange(num_tokens, tokens.Count - num_tokens);
 		}
 
 		public int encode(List<ushort> tokens, ReadOnlySpan<byte> text, TokenizerFlags flags = TokenizerFlags.TF_ENCODE_NONE)
 		{
-			int n_tokens = 0;
-
 			// add optional BOS token, if desired
 			if (0 != (flags & TokenizerFlags.TF_ENCODE_BOS) && ushort.MaxValue != bos_id_)
 			{
@@ -398,26 +396,52 @@ namespace cslm
 
 				codepoint[0] = text[i++];
 
-				if (i < text.Length && codepoint[0] == '<' && text[i] == '|')
+				if (i < text.Length && codepoint[0] == '<')
 				{
-					// special token, skip until '|>'
-					int e = i + 1;
-					while (e < (text.Length - 1) && !(text[e] == '|' && text[e + 1] == '>'))
+					if (text[i] == '|')
 					{
-						e++;
-					}
-					if (text[e] == '|' && text[e + 1] == '>' && (e - i + 3) <= MAX_TOKEN_LENGTH)
-					{
-						// we found the end of the special token, try to encode it as is
-						ReadOnlySpan<byte> special = text.Slice(i - 1, e - i + 3);
-
-						int sid = str_lookup(special);
-						if (sid != -1)
+						// special token, skip until '|>'
+						int e = i + 1;
+						while (e < (text.Length - 1) && !(text[e] == '|' && text[e + 1] == '>'))
 						{
-							// we found special codepoint in vocab, add it as a token
-							tokens.Add((ushort)sid);
-							i = e + 2;
-							continue;
+							e++;
+						}
+						if (text[e] == '|' && text[e + 1] == '>' && (e - i + 3) <= MAX_TOKEN_LENGTH)
+						{
+							// we found the end of the special token, try to encode it as is
+							ReadOnlySpan<byte> special = text.Slice(i - 1, e - i + 3);
+
+							int sid = str_lookup(special);
+							if (sid != -1)
+							{
+								// we found special codepoint in vocab, add it as a token
+								tokens.Add((ushort)sid);
+								i = e + 2;
+								continue;
+							}
+						}
+					}
+					else
+					{
+						// special token, skip until '>'
+						int e = i;
+						while (e < text.Length && text[e] != '>')
+						{
+							e++;
+						}
+						if (text[e] == '>' && (e - i + 2) <= MAX_TOKEN_LENGTH)
+						{
+							// we found the end of the special token, try to encode it as is
+							ReadOnlySpan<byte> special = text.Slice(i - 1, e - i + 2);
+
+							int sid = str_lookup(special);
+							if (sid != -1)
+							{
+								// we found special codepoint in vocab, add it as a token
+								tokens.Add((ushort)sid);
+								i = e + 1;
+								continue;
+							}
 						}
 					}
 				}
@@ -426,9 +450,9 @@ namespace cslm
 				int code_length = 1;
 				if ((codepoint[0] & 0xC0U) == 0xC0U)
 				{
-					for (;(i+code_length) < text.Length && code_length < 4 && (text[i + code_length] & 0xC0) == 0x80; ++code_length)
+					for (; code_length < 4 && i < text.Length && (text[i] & 0xC0) == 0x80; ++code_length)
 					{
-						codepoint[code_length] = text[i + code_length];
+						codepoint[code_length] = text[i++];
 					}
 				}
 
@@ -470,7 +494,7 @@ namespace cslm
 			{
 				ReadOnlySpan<byte> bytes = get_sorted_token(i);
 				string str = Encoding.UTF8.GetString(bytes);
-				Debug.WriteLine(str);
+				//Debug.WriteLine(str);
 				if (0 < prev.Length)
 				{
 					if (strcmp(prev, bytes) > 0)

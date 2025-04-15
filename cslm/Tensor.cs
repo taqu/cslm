@@ -55,6 +55,7 @@ namespace cslm
 		private List<Metadata> metadata_ = new List<Metadata>();
         private List<Tensor> tensors_ = new List<Tensor>();
 
+        public byte[]? Bytes { get { return data_; } }
         public Tensor this[int index]
         {
             get
@@ -91,6 +92,23 @@ namespace cslm
 		{
 			return tensors_[find(name, 0)];
 		}
+
+        public Tensor get_tensor(string name, int layer, DType dtype, int shape0, int shape1, int shape2, int shape3)
+        {
+            int index = find(name, layer, dtype, shape0, shape1, shape2, shape3);
+			if (index < 0)
+			{
+				return new Tensor();
+			}
+			return tensors_[index];
+		}
+
+		public bool find(string name, int layer, out int index)
+		{
+            index = find(name, layer);
+            return 0 <= index;
+		}
+
 		public int find(string name, int layer)
         {
             name = string.Format(name, layer);
@@ -201,6 +219,16 @@ namespace cslm
 				return value;
 			}
 			return default_value;
+		}
+
+		public string get_metadata_str(string key, string default_value)
+		{
+			int index = find_metadata(key);
+			if (index < 0)
+			{
+				return default_value;
+			}
+            return get_metadata_value(index);
 		}
 
 		private class JsonParser
