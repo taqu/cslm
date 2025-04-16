@@ -42,6 +42,10 @@ namespace cslm
 		private const int BufferSize = 128;
 		private byte[] buffer_ = new byte[BufferSize];
 
+		public ushort BOS_ID => bos_id_;
+		public ushort EOS_ID => eos_id_;
+		public ushort EOT_ID => eot_id_;
+
 		private static int length(byte[] tokens, int offset)
 		{
 			for (int i = offset; i < tokens.Length; ++i)

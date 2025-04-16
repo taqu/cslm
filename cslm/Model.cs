@@ -1,9 +1,7 @@
-using System.IO;
-using System.Reflection;
-using static System.Net.WebRequestMethods;
-using System.Xml.Linq;
+using CommunityToolkit.HighPerformance;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
-using static System.Net.Mime.MediaTypeNames;
 
 namespace cslm
 {
@@ -12,8 +10,9 @@ namespace cslm
 		public Tensors tensors_;
 		public Transformer transformer_;
 		public Tokenizer tokenizer_;
+		public Sampler sampler_;
 
-		public bool initialize(string model)
+		public bool initialize(string model, int context_size)
 		{
 			tensors_ = Tensors.OpenAsync(model).Result;
 			if (null == tensors_)
@@ -21,13 +20,14 @@ namespace cslm
 				return false;
 			}
 			transformer_ = new Transformer();
-			get_config(2048);
+			get_config(context_size);
 			get_tokenizer();
 			get_weights();
 			if (!tokenizer_.check_vocab())
 			{
 				return false;
 			}
+
 			ulong dummy;
 			transformer_.n_bytes_ = count_bytes(tensors_, "model.", null, out transformer_.n_params_);
 			transformer_.n_bandwidth_ = transformer_.n_bytes_ - count_bytes(tensors_, "model.embed.", null, out dummy);
@@ -54,18 +54,26 @@ namespace cslm
         private ulong kvcache_bandwidth(int kvbits, int pos) {
 
     int kv_dim = transformer_.config_.head_dim_ * transformer_.config_.n_kv_heads_;
-        int kv_len = pos >= config->seq_len ? config->seq_len : pos + 1;
-	return 2 * (size_t) (kvbits / 8) * config->n_layers* kv_dim * kv_len;
+        int kv_len = transformer_.config_.seq_len_<=pos ? transformer_.config_.seq_len_ : pos + 1;
+	return (ulong)(2L * (kvbits / 8)* transformer_.config_.n_layers_* kv_dim * kv_len);
 }
 
 		public void run(Context context)
 		{
+			Debug.Assert(null != transformer_.forward_);
+			sampler_.vocab_size_ = transformer_.config_.vocab_size_;
+			sampler_.temperature_ = context.temperature_;
+			sampler_.minp_ = context.pvalue_;
+			sampler_.random_.seed(context.seed_);
+
+			Stopwatch sw = new Stopwatch();
 			int steps = context.steps_ == 0 ? transformer_.config_.seq_len_ : context.steps_;
 			int pos_offset = 0;
-
-            List<ushort> tokens = new List<ushort>(); ;
-			for(int i=0; i<context.sequences_; ++i)
+            List<ushort> tokens = new List<ushort>();
+			List<byte> pieces = new List<byte>();
+			for (int i=0; i<context.sequences_; ++i)
 			{
+				sw.Start();
 				tokens.Clear();
 
 				byte[] bytes = Encoding.UTF8.GetBytes(context.input_);
@@ -75,8 +83,10 @@ namespace cslm
 			}
 				int token = tokens[0];
 				int pos = 0;
+				int next;
 				ulong read_bytes = 0;
-                while (pos < steps || steps < 0)
+				float[]? logits_last = null;
+				while (pos < steps || steps < 0)
                 {
 					// forward the transformer to get logits for the next token
 					ForwardFlags flags = pos < tokens.Count - 1 ? ForwardFlags.FF_UPDATE_KV_ONLY : ForwardFlags.FF_NONE;
@@ -84,54 +94,51 @@ namespace cslm
 
                     read_bytes += transformer_.n_bandwidth_;
 
-                    read_bytes += kvcache_bandwidth(&transformer->config, transformer->state.kvbits, pos + pos_offset);
+                    read_bytes += kvcache_bandwidth(transformer_.state_.kvbits_, pos + pos_offset);
                     logits_last = logits;
 
                     // advance the state machine
-                    if (pos < num_prompt_tokens - 1)
+                    if (pos < tokens.Count - 1)
                     {
                         // if we are still processing the input prompt, force the next prompt token
-                        next = prompt_tokens[pos + 1];
+                        next = tokens[pos + 1];
                     }
                     else
                     {
-                        // otherwise sample the next token from the logits
-                        next = sample(sampler, logits);
-                        assert(next >= 0);
+						// otherwise sample the next token from the logits
+						next = Sampler.sample(sampler_, logits);
+                        Debug.Assert(0<=next);
 
                         // data-dependent terminating condition: the BOS token delimits sequences, EOS token ends the sequence, EOT token ends the turn
-                        if (next == tokenizer->bos_id || next == tokenizer->eos_id || next == tokenizer->eot_id)
+                        if (next == tokenizer_.BOS_ID || next == tokenizer_.EOS_ID || next == tokenizer_.EOT_ID)
                         {
                             break;
                         }
                     }
                     pos++;
 
-                    // print the token as string, decode it with the Tokenizer object
-                    char* piece = tokenizer_decode(tokenizer, token, next);
-                    printf("%s", piece);
-                    fflush(stdout);
+					// print the token as string, decode it with the Tokenizer object
+					ReadOnlySpan<byte> piece = tokenizer_.decode(token, next);
+					pieces.AddRange(piece);
                     token = next;
                 }
-                printf("\n");
-
-                long end = time_in_ms();
-
+				sw.Stop();
+				Console.WriteLine(Encoding.UTF8.GetString(pieces.AsSpan<byte>()));
                 // fold last token's logits into a hash for validation
-                unsigned logits_hash = 0;
-                if (logits_last)
+                uint logits_hash = 0;
+                if (null != logits_last)
                 {
-                    for (int k = 0; k < transformer->config.vocab_size; ++k)
-                    {
-                        logits_hash = logits_hash * 5 + *(unsigned*)(&logits_last[k]);
-                    }
+					ReadOnlySpan<byte> logits = MemoryMarshal.Cast<float, byte>(logits_last);
+					logits_hash = System.IO.Hashing.XxHash32.HashToUInt32(logits);
                 }
-
-                fprintf(stderr, "# %d tokens: throughput: %.2f tok/s; latency: %.2f ms/tok; bandwidth: %.2f GB/s; total %.3f sec; #%08x\n",
-                        pos,
-                        pos / (double)(end - start) * 1000, (double)(end - start) / pos,
-                        ((double)read_bytes / 1e9) / ((double)(end - start) / 1000),
-                        (double)(end - start) / 1000, logits_hash);
+				string str = string.Format("# {0} tokens: throughput: {1} tok/s; latency: {2} ms/tok; bandwidth: {3} GB/s; total {4} sec; #{5:X}",
+					pos,
+					pos / sw.Elapsed.TotalSeconds,
+					sw.Elapsed.TotalSeconds / pos,
+					((double)read_bytes / 1e9) / sw.Elapsed.TotalSeconds,
+					sw.Elapsed.TotalSeconds,
+					logits_hash);
+				Console.WriteLine(str);
             }
         }
 

@@ -67,7 +67,7 @@ namespace cslm.run
 
 
 			Model model = new Model();
-			if (!model.initialize(options))
+			if (!model.initialize(options.model_, options.context_length_))
 			{
 				return;
 			}
