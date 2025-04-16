@@ -9,6 +9,7 @@ namespace cslm
 	{
 		public const int SFMT_MEXP = 607;
 		public const int SFMT_N = (SFMT_MEXP / 128 + 1);
+		public const int SFMT_N8 = SFMT_N * 16;
 		public const int SFMT_N32 = SFMT_N * 4;
 		public const int SFMT_N64 = SFMT_N * 2;
 		public const int SFMT_POS1 = 2;
@@ -130,9 +131,30 @@ namespace cslm
 			for (int i = 1; i < SFMT_N64; ++i)
 			{
 				ulong z = span[i - 1] + 0x9e3779b97f4a7c15UL;
-				z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
-				z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+				z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9UL;
+				z = (z ^ (z >> 27)) * 0x94d049bb133111ebUL;
 				span[i] = z ^ (z >> 31);
+			}
+			index_ = SFMT_N32;
+			period_certification();
+		}
+
+		public void seed(IEnumerable<byte> s)
+		{
+			Span<byte> span = MemoryMarshal.Cast<uint, byte>(state_);
+			int count = 0;
+			foreach(byte b in s){
+				if (SFMT_N8 <= count)
+				{
+					break;
+				}
+				span[count] = b;
+				++count;
+			}
+			while(count< SFMT_N8)
+			{
+				span[count] = 0;
+				++count;
 			}
 			index_ = SFMT_N32;
 			period_certification();
