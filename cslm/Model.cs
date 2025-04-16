@@ -2,20 +2,20 @@ using System.IO;
 using System.Reflection;
 using static System.Net.WebRequestMethods;
 using System.Xml.Linq;
+using System.Text;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace cslm
 {
 	public struct Model
 	{
-		public Options options_;
 		public Tensors tensors_;
 		public Transformer transformer_;
 		public Tokenizer tokenizer_;
 
-		public bool initialize(Options options)
+		public bool initialize(string model)
 		{
-			options_ = options;
-			tensors_ = Tensors.OpenAsync(options_.model_).Result;
+			tensors_ = Tensors.OpenAsync(model).Result;
 			if (null == tensors_)
 			{
 				return false;
@@ -50,6 +50,90 @@ namespace cslm
 			transformer_.forward_(transformer_, 0, 0, 0);
 			return true;
 		}
+
+        private ulong kvcache_bandwidth(int kvbits, int pos) {
+
+    int kv_dim = transformer_.config_.head_dim_ * transformer_.config_.n_kv_heads_;
+        int kv_len = pos >= config->seq_len ? config->seq_len : pos + 1;
+	return 2 * (size_t) (kvbits / 8) * config->n_layers* kv_dim * kv_len;
+}
+
+		public void run(Context context)
+		{
+			int steps = context.steps_ == 0 ? transformer_.config_.seq_len_ : context.steps_;
+			int pos_offset = 0;
+
+            List<ushort> tokens = new List<ushort>(); ;
+			for(int i=0; i<context.sequences_; ++i)
+			{
+				tokens.Clear();
+
+				byte[] bytes = Encoding.UTF8.GetBytes(context.input_);
+				tokenizer_.encode(tokens, bytes, TokenizerFlags.TF_ENCODE_BOS);
+				if(tokens.Count <= 0){
+					return;
+			}
+				int token = tokens[0];
+				int pos = 0;
+				ulong read_bytes = 0;
+                while (pos < steps || steps < 0)
+                {
+					// forward the transformer to get logits for the next token
+					ForwardFlags flags = pos < tokens.Count - 1 ? ForwardFlags.FF_UPDATE_KV_ONLY : ForwardFlags.FF_NONE;
+					float[] logits = transformer_.forward_(transformer_, token, pos + pos_offset, (uint)flags);
+
+                    read_bytes += transformer_.n_bandwidth_;
+
+                    read_bytes += kvcache_bandwidth(&transformer->config, transformer->state.kvbits, pos + pos_offset);
+                    logits_last = logits;
+
+                    // advance the state machine
+                    if (pos < num_prompt_tokens - 1)
+                    {
+                        // if we are still processing the input prompt, force the next prompt token
+                        next = prompt_tokens[pos + 1];
+                    }
+                    else
+                    {
+                        // otherwise sample the next token from the logits
+                        next = sample(sampler, logits);
+                        assert(next >= 0);
+
+                        // data-dependent terminating condition: the BOS token delimits sequences, EOS token ends the sequence, EOT token ends the turn
+                        if (next == tokenizer->bos_id || next == tokenizer->eos_id || next == tokenizer->eot_id)
+                        {
+                            break;
+                        }
+                    }
+                    pos++;
+
+                    // print the token as string, decode it with the Tokenizer object
+                    char* piece = tokenizer_decode(tokenizer, token, next);
+                    printf("%s", piece);
+                    fflush(stdout);
+                    token = next;
+                }
+                printf("\n");
+
+                long end = time_in_ms();
+
+                // fold last token's logits into a hash for validation
+                unsigned logits_hash = 0;
+                if (logits_last)
+                {
+                    for (int k = 0; k < transformer->config.vocab_size; ++k)
+                    {
+                        logits_hash = logits_hash * 5 + *(unsigned*)(&logits_last[k]);
+                    }
+                }
+
+                fprintf(stderr, "# %d tokens: throughput: %.2f tok/s; latency: %.2f ms/tok; bandwidth: %.2f GB/s; total %.3f sec; #%08x\n",
+                        pos,
+                        pos / (double)(end - start) * 1000, (double)(end - start) / pos,
+                        ((double)read_bytes / 1e9) / ((double)(end - start) / 1000),
+                        (double)(end - start) / 1000, logits_hash);
+            }
+        }
 
 		private static ulong count_bytes(Tensors tensors, string prefix, string? filter, out ulong out_params)
 		{

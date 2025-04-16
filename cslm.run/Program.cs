@@ -15,7 +15,7 @@ namespace cslm.run
 
 		static void Main(string[] args)
 		{
-			cslm.Options options = new cslm.Options();
+			cslm.Context options = new cslm.Context();
 			{
 				RootCommand rootCommand = new RootCommand
 				{

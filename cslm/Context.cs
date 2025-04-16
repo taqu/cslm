@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace cslm
 {
-	public struct Options
+	public struct Context
 	{
 		public string model_;
 		public float temperature_;

@@ -29,6 +29,7 @@ namespace cslm
 
     public enum ForwardFlags
     {
+        FF_NONE = 0,
         FF_UPDATE_KV_ONLY = 1 << 0, // only update kv cache and don't output logits
     };
 }

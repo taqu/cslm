@@ -6,14 +6,6 @@ namespace cslm
 {
 	public struct Random
 	{
-		public struct W128
-		{
-			public uint x0_;
-			public uint x1_;
-			public uint x2_;
-			public uint x3_;
-		}
-
 		public const int SFMT_MEXP = 607;
 		public const int SFMT_N = (SFMT_MEXP / 128 + 1);
 		public const int SFMT_N32 = SFMT_N * 4;
@@ -32,92 +24,121 @@ namespace cslm
 		public const uint SFMT_PARITY4 = 0x5986f054U;
 
 		private uint index_;
-		private W128[] state_;
+		private uint[] state_;
 
-		public Random()
+		public Random(uint s=0)
 		{
 			index_ = 0;
-			state_ = new W128[SFMT_N];
+			state_ = new uint[SFMT_N32];
+            seed(s);
 		}
 
-		private static void lshift128(out W128 r, in W128 i, int shift)
+		private void check_modification(int i, uint parity)
 		{
+            uint work = 1;
+            for (int j = 0; j < 32; ++j)
+            {
+                if ((work & parity) != 0)
+                {
+                    state_[i] ^= work;
+                    return;
+                }
+                work = work << 1;
+            }
 
-			ulong th = ((ulong)i.x3_ << 32) | ((ulong)i.x2_);
-			ulong tl = ((ulong)i.x1_ << 32) | ((ulong)i.x0_);
-			ulong oh = th << (shift * 8);
-			ulong ol = tl << (shift * 8);
-			oh |= tl >> (64 - shift * 8);
-			r.x1_ = (uint)(ol >> 32);
-			r.x0_ = (uint)ol;
-			r.x3_ = (uint)(oh >> 32);
-			r.x2_ = (uint)oh;
-		}
+        }
 
-		private static void rshift128(out W128 r, in W128 i, int shift)
-		{
-			ulong th = ((ulong)i.x3_ << 32) | ((ulong)i.x2_);
-			ulong tl = ((ulong)i.x1_ << 32) | ((ulong)i.x0_);
-			ulong oh = th >> (shift * 8);
-			ulong ol = tl >> (shift * 8);
-			ol |= th << (64 - shift * 8);
-			r.x1_ = (uint)(ol >> 32);
-			r.x0_ = (uint)ol;
-			r.x3_ = (uint)(oh >> 32);
-			r.x2_ = (uint)oh;
-		}
-
-		private static void do_recursion(ref W128 r, W128 a, W128 b, W128 c, W128 d)
-		{
-			W128 x;
-			W128 y;
-			lshift128(out x, a, SFMT_SL2);
-			rshift128(out y, c, SFMT_SR2);
-			r.x0_ = a.x0_ ^ x.x0_ ^ ((b.x0_ >> SFMT_SR1) & SFMT_MSK1) ^ y.x0_ ^ (d.x0_ << SFMT_SL1);
-			r.x1_ = a.x1_ ^ x.x1_ ^ ((b.x1_ >> SFMT_SR1) & SFMT_MSK2) ^ y.x1_ ^ (d.x1_ << SFMT_SL1);
-			r.x2_ = a.x2_ ^ x.x2_ ^ ((b.x2_ >> SFMT_SR1) & SFMT_MSK3) ^ y.x2_ ^ (d.x2_ << SFMT_SL1);
-			r.x3_ = a.x3_ ^ x.x3_ ^ ((b.x3_ >> SFMT_SR1) & SFMT_MSK4) ^ y.x3_ ^ (d.x3_ << SFMT_SL1);
-		}
+        private void period_certification()
+        {
+            uint inner = 0;
+			{
+                inner ^= state_[0] & SFMT_PARITY1;
+                inner ^= state_[1] & SFMT_PARITY2;
+                inner ^= state_[2] & SFMT_PARITY3;
+                inner ^= state_[3] & SFMT_PARITY4;
+            }
+            for (int i = 16; 0<i; i >>= 1)
+            {
+                inner ^= inner >> i;
+            }
+            inner &= 1;
+            if (inner == 1)
+            {
+                return;
+            }
+			check_modification(0, SFMT_PARITY1);
+            check_modification(1, SFMT_PARITY2);
+            check_modification(2, SFMT_PARITY3);
+            check_modification(3, SFMT_PARITY4);
+        }
 
 		private void generate()
 		{
-			W128 r1 = state_[SFMT_N - 2];
-			W128 r2 = state_[SFMT_N - 1];
-			int i;
-			for (i = 0; i < SFMT_N - SFMT_POS1; ++i)
-			{
-				do_recursion(ref state_[i], state_[i], state_[i + SFMT_POS1], r1, r2);
-				r1 = r2;
-				r2 = state_[i];
-			}
-			for (; i < SFMT_N; ++i)
-			{
-				do_recursion(ref state_[i], state_[i], state_[i + SFMT_POS1 - SFMT_N], r1, r2);
-				r1 = r2;
-				r2 = state_[i];
-			}
-		}
+            const int SL2_x8 = SFMT_SL2 * 8;
+            const int SR2_x8 = SFMT_SR2 * 8;
+            const int SL2_ix8 = 64 - SFMT_SL2 * 8;
+            const int SR2_ix8 = 64 - SFMT_SR2 * 8;
 
-		public uint rand()
+            int a = 0;
+            int b = SFMT_POS1 * 4;
+            int c = (SFMT_N - 2) * 4;
+            int d = (SFMT_N - 1) * 4;
+            do
+            {
+                ulong xh = ((ulong)state_[a + 3] << 32) | state_[a + 2];
+                ulong xl = ((ulong)state_[a + 1] << 32) | state_[a + 0];
+                ulong yh = xh << (SL2_x8) | xl >> (SL2_ix8);
+                ulong yl = xl << (SL2_x8);
+                xh = ((ulong)state_[c + 3] << 32) | state_[c + 2];
+                xl = ((ulong)state_[c + 1] << 32) | state_[c + 0];
+                yh ^= xh >> (SR2_x8);
+                yl ^= xl >> (SR2_x8) | xh << (SR2_ix8);
+
+                state_[a + 3] = state_[a + 3] ^ ((state_[b + 3] >> SFMT_SR1) & SFMT_MSK4) ^ (state_[d + 3] << SFMT_SL1) ^ ((uint)(yh >> 32));
+                state_[a + 2] = state_[a + 2] ^ ((state_[b + 2] >> SFMT_SR1) & SFMT_MSK3) ^ (state_[d + 2] << SFMT_SL1) ^ ((uint)yh);
+                state_[a + 1] = state_[a + 1] ^ ((state_[b + 1] >> SFMT_SR1) & SFMT_MSK2) ^ (state_[d + 1] << SFMT_SL1) ^ ((uint)(yl >> 32));
+                state_[a + 0] = state_[a + 0] ^ ((state_[b + 0] >> SFMT_SR1) & SFMT_MSK1) ^ (state_[d + 0] << SFMT_SL1) ^ ((uint)yl);
+
+                c = d;
+                d = a;
+                a += 4;
+                b += 4;
+                if (SFMT_N32<=b)
+                {
+                    b = 0;
+                }
+            } while (a < SFMT_N32);
+        }
+
+		public void seed(uint s)
 		{
-			if (SFMT_N32 <= index_)
+			state_[0] = s;
+			for(int i=1; i<SFMT_N32; ++i)
 			{
-				generate();
-				index_ = 0;
-			}
-			uint i = index_ >> 2;
-			uint r = index_ & 3U;
-			switch (r)
-			{
-				case 0:
-					return state_[i].x0_;
-				case 1:
-					return state_[i].x1_;
-				case 2:
-					return state_[i].x2_;
-				default:
-					return state_[i].x3_;
-			}
-		}
+                state_[i] = (uint)(1812433253U * (state_[i - 1] ^ (state_[i - 1] >> 30)) + i);
+            }
+			index_ = SFMT_N32;
+                period_certification();
+        }
+
+        public uint rand()
+		{
+            if (SFMT_N32 <= index_)
+            {
+                generate();
+                index_ = 1;
+                return state_[0];
+            }
+            else
+            {
+                return state_[index_++];
+            }
+        }
+
+        public float frand()
+        {
+            uint u = rand();
+            return (u >> 8) / 16777216.0f;
+        }
 	}
 }
