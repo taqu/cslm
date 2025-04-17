@@ -32,14 +32,10 @@ namespace cslm
         public Tensor[] w1_; // (n_experts?, hidden_dim, dim)
         public Tensor[] w2_; // (n_experts?, dim, hidden_dim)
         public Tensor[] w3_; // (n_experts?, hidden_dim, dim)
-                            // final norm
-        public Tensor rms_final_weight_; // (dim,)
-                                          // classifier weights for the logits, on the last layer
-        public Tensor wcls_;
-        // biases for qkv (qwen)
-        public Tensor[] bqkv_; // ((n_heads + n_kv_heads * 2) * head_dim)
-                               // moe gate weights (mixtral)
-        public Tensor[] moegate_; // (n_experts, dim)
-	 };
+        public Tensor rms_final_weight_; // final norm (dim,)
+        public Tensor wcls_; // classifier weights for the logits, on the last layer
+		public Tensor[]? bqkv_; // ((n_heads + n_kv_heads * 2) * head_dim)
+        public Tensor[] moegate_; // moe gate weights (mixtral) (n_experts, dim)
+	};
 
 }

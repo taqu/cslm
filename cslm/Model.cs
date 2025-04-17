@@ -262,7 +262,6 @@ namespace cslm
 			transformer_.weights_.w1_ = new Tensor[transformer_.config_.n_layers_];
 			transformer_.weights_.w2_ = new Tensor[transformer_.config_.n_layers_];
 			transformer_.weights_.w3_ = new Tensor[transformer_.config_.n_layers_];
-			transformer_.weights_.bqkv_ = new Tensor[transformer_.config_.n_layers_];
 			if (0 < transformer_.config_.n_experts_)
 			{
 				transformer_.weights_.moegate_ = new Tensor[transformer_.config_.n_layers_];
@@ -284,6 +283,10 @@ namespace cslm
 				transformer_.weights_.wo_[l] = tensors_.get_tensor("model.layers.{0}.attn.wo.weight", l, wtype, transformer_.config_.dim_, layer_dim1, 0, 0);
 				if (0 <= tensors_.find("model.layers.{0}.attn.wqkv.bias", l))
 				{
+					if (null == transformer_.weights_.bqkv_)
+					{
+						transformer_.weights_.bqkv_ = new Tensor[transformer_.config_.n_layers_];
+					}
 					transformer_.weights_.bqkv_[l] = tensors_.get_tensor("model.layers.{0}.attn.wqkv.bias", l, DType.dt_f32, (transformer_.config_.n_heads_ + transformer_.config_.n_kv_heads_ * 2) * transformer_.config_.head_dim_, 0, 0, 0);
 				}
 

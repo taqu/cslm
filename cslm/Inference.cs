@@ -293,7 +293,7 @@ namespace cslm
                 Span<byte> wq = transformer.weights_.AsSpan<byte>(transformer.weights_.wq_[l]);
                 Span<byte> wk = transformer.weights_.AsSpan<byte>(transformer.weights_.wk_[l]);
                 Span<byte> wv = transformer.weights_.AsSpan<byte>(transformer.weights_.wv_[l]);
-                int bqkv_len = transformer.weights_.bqkv_.Length;
+                int bqkv_len = (null != transformer.weights_.bqkv_)? transformer.weights_.bqkv_.Length : 0;
                 Span<float> bqkv = 0 < bqkv_len ? transformer.weights_.AsSpan<float>(transformer.weights_.bqkv_[l]) : empty_span;
                 matmul(transformer.state_.q_, transformer.state_.xb_, wq, bqkv, dim, q_dim, dotprod);
                 bqkv = 0 < bqkv_len ? bqkv.Slice(q_dim) : empty_span;
