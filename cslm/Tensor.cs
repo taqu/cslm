@@ -49,8 +49,8 @@ namespace cslm
     public class Tensors
     {
         private long size_;
-		private long byte_offset_;
-		private long byte_size_;
+		private long data_offset_;
+		private long data_size_;
 		private byte[]? data_;
 		private List<Metadata> metadata_ = new List<Metadata>();
         private List<Tensor> tensors_ = new List<Tensor>();
@@ -146,10 +146,10 @@ namespace cslm
 			{
 				if (tensors_[i].name_ == name)
 				{
-                    return MemoryMarshal.Cast<byte, T>(data_.AsSpan<byte>((int)(tensors_[i].data_ + byte_offset_), (int)tensors_[i].size_));
+                    return MemoryMarshal.Cast<byte, T>(data_.AsSpan<byte>((int)(tensors_[i].data_), (int)tensors_[i].size_));
 				}
 			}
-            return new ReadOnlySpan<T>(); ;
+            return new ReadOnlySpan<T>();
 		}
 
 		public int num_metadata()
@@ -571,7 +571,11 @@ namespace cslm
                 input[json + json_size - 1] = 0;
                 json = parser.json_skipws(json + 1, input);
                 Tensors tensors = new Tensors();
-                while (json < json_end && input[json] != '}')
+				tensors.size_ = input.LongLength;
+				tensors.data_ = input;
+				tensors.data_offset_ = json_end;
+				tensors.data_size_ = bytes_size;
+				while (json < json_end && input[json] != '}')
                 {
                     string key;
                     json = parser.json_string(json, input, out key);
@@ -605,10 +609,12 @@ namespace cslm
                     }
                     json = (input[json] == ',') ? parser.json_skipws(json + 1, input) : json;
                 }
-                tensors.size_ = input.LongLength;
-                tensors.data_ = input;
-                tensors.byte_offset_ = json_end;
-                tensors.byte_size_ = bytes_size;
+                for(int i=0; i< tensors.tensors_.Count; ++i)
+                {
+                    Tensor tensor = tensors.tensors_[i];
+                    tensor.data_ += tensors.data_offset_;
+                    tensors.tensors_[i] = tensor;
+                }
 				return tensors;
             }
         }
