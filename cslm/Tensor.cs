@@ -38,6 +38,12 @@ namespace cslm
         public int shape3_;
         public long data_;
         public long size_;
+
+        [Conditional("DEBUG")]
+        public void print()
+        {
+            Console.WriteLine("{0} ({1}): offset:{2}", name_, dtype_.ToString(), data_);
+        }
     };
 
     public struct Metadata

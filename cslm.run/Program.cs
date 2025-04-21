@@ -15,7 +15,9 @@ namespace cslm.run
 
 		static void Main(string[] args)
 		{
-			cslm.Context options = new cslm.Context();
+			cslm.Device device = new cslm.Device();
+			device.Initialize();
+			cslm.Context context = new cslm.Context();
 			{
 				RootCommand rootCommand = new RootCommand
 				{
@@ -44,16 +46,16 @@ namespace cslm.run
 
 				ParseResult result = rootCommand.Parse(args);
 
-				options.model_ = result.GetValueForArgument<string>(checkpoint);
-				options.temperature_ = result.GetValueForOption<float>(temperature);
-				options.pvalue_ = result.GetValueForOption<float>(pvalue);
-				options.seed_ = result.GetValueForOption<ulong>(seed);
-				options.steps_ = result.GetValueForOption<int>(steps);
-				options.sequences_ = result.GetValueForOption<int>(sequences);
-				options.context_length_ = result.GetValueForOption<int>(context_length);
-				options.input_ = result.GetValueForOption<string>(input);
-				options.perplexity_ = result.GetValueForOption<string>(perplexity);
-				options.system_prompt_ = result.GetValueForOption<string>(system_prompt);
+				context.model_ = result.GetValueForArgument<string>(checkpoint);
+				context.temperature_ = result.GetValueForOption<float>(temperature);
+				context.pvalue_ = result.GetValueForOption<float>(pvalue);
+				context.seed_ = result.GetValueForOption<ulong>(seed);
+				context.steps_ = result.GetValueForOption<int>(steps);
+				context.sequences_ = result.GetValueForOption<int>(sequences);
+				context.context_length_ = result.GetValueForOption<int>(context_length);
+				context.input_ = result.GetValueForOption<string>(input);
+				context.perplexity_ = result.GetValueForOption<string>(perplexity);
+				context.system_prompt_ = result.GetValueForOption<string>(system_prompt);
 
 				if (0 < result.Errors.Count)
 				{
@@ -67,10 +69,11 @@ namespace cslm.run
 
 
 			Model model = new Model();
-			if (!model.initialize(options.model_, options.context_length_))
+			if (!model.initialize(context.model_, context.context_length_))
 			{
 				return;
 			}
-		}
+			model.run(context);
+        }
 	}
 }

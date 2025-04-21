@@ -6,8 +6,15 @@ namespace cslm
 		public float temperature_;
 		public float minp_;
 		public Random random_;
+		public Sampler()
+		{
+			vocab_size_ = 0;
+			temperature_ = 1.0f;
+			minp_ = 0.1f;
+            random_ = new Random(0);
+        }
 
-		public static float sample_prob(int idx, float[] logits, int size)
+        public static float sample_prob(int idx, float[] logits, int size)
 		{
 			// find max value (for numerical stability)
 			float max_val = float.MinValue;
@@ -83,7 +90,7 @@ namespace cslm
 
 		public static int sample(in Sampler sampler, float[] logits)
 		{
-			if (sampler.temperature_ == 0.0f || 1.0f <= sampler.minp_)
+			if (sampler.temperature_ < 1.0e-6f || 1.0f <= sampler.minp_)
 			{
 				// greedy argmax sampling: take the token with the highest probability
 				return sample_argmax(logits, sampler.vocab_size_);

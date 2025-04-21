@@ -29,7 +29,7 @@ namespace cslm
 		private uint index_;
 		private uint[] state_;
 
-		public Random(uint s = 0)
+		public Random(uint s)
 		{
 			index_ = 0;
 			state_ = new uint[SFMT_N32];

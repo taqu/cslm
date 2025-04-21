@@ -1,5 +1,8 @@
 using CommunityToolkit.HighPerformance;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace cslm
 {
@@ -12,7 +15,6 @@ namespace cslm
 			ushort u = v;
 			u <<= 8;
 			kvtype_t h = BitConverter.UInt16BitsToHalf(u);
-			string s = h.ToString();
 			return h;
 		}
 
@@ -44,7 +46,7 @@ namespace cslm
 			return val;
 		}
 
-		public static float dotprod_gf4(Span<byte> w, int n, int i, float[] x)
+        public static float dotprod_gf4(Span<byte> w, int n, int i, float[] x)
 		{
 			Span<uint> r = MemoryMarshal.Cast<byte, uint>(w).Slice(i * n / 8);
 			float val = 0.0f;
@@ -280,12 +282,6 @@ namespace cslm
 					x[i] = (float)h;
 				}
 			}
-#if DEBUG
-			//foreach(float fx in x)
-			//{
-			//	Console.WriteLine(fx);
-			//}
-#endif
 			Span<float> empty_span = new Span<float>();
 
 			// forward all the layers
@@ -308,8 +304,8 @@ namespace cslm
 				bqkv = 0 < bqkv_len ? bqkv.Slice(kv_dim) : empty_span;
 				matmul(transformer.state_.v_, transformer.state_.xb_, wv, bqkv, dim, kv_dim, dotprod);
 
-				// some models require clipping qkv values
-				for (int i = 0; i < q_dim; ++i)
+                // some models require clipping qkv values
+                for (int i = 0; i < q_dim; ++i)
 				{
 					transformer.state_.q_[i] = clip(transformer.state_.q_[i], transformer.config_.qkv_clip_);
 				}
@@ -319,11 +315,12 @@ namespace cslm
 					transformer.state_.v_[i] = clip(transformer.state_.v_[i], transformer.config_.qkv_clip_);
 				}
 
-				// RoPE relative positional encoding: complex-valued rotate q and k in each head
-				rope(transformer.state_.q_, q_dim, transformer.config_.head_dim_, pos, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
+                // RoPE relative positional encoding: complex-valued rotate q and k in each head
+                rope(transformer.state_.q_, q_dim, transformer.config_.head_dim_, pos, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
 				rope(transformer.state_.k_, kv_dim, transformer.config_.head_dim_, pos, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
-				// key and value point to the kv cache
-				int loff = l * transformer.config_.seq_len_ * kv_dim; // kv cache layer offset for convenience
+
+                // key and value point to the kv cache
+                int loff = l * transformer.config_.seq_len_ * kv_dim; // kv cache layer offset for convenience
 				Span<kvtype_t> kb = MemoryMarshal.Cast<byte, kvtype_t>(transformer.state_.key_cache_.AsSpan()).Slice(loff);
 				Span<kvtype_t> vb = MemoryMarshal.Cast<byte, kvtype_t>(transformer.state_.value_cache_.AsSpan()).Slice(loff);
 
@@ -369,13 +366,14 @@ namespace cslm
 				{
 					x[i] += transformer.state_.hb_[i];
 				}
-				if (!transformer.config_.norm_par_)
+
+                if (!transformer.config_.norm_par_)
 				{
 					// ffn rmsnorm
 					rmsnorm(transformer.state_.xb_, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_ffn_weight_[l]), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
-				}
+                }
 
-				Span<float> moe_weights = transformer.state_.exp_.AsSpan(transformer.config_.n_experts_);
+                Span<float> moe_weights = transformer.state_.exp_.AsSpan(transformer.config_.n_experts_);
 				Span<int> moe_experts = MemoryMarshal.Cast<float, int>(moe_weights).Slice(0 != transformer.config_.n_experts_ac_ ? transformer.config_.n_experts_ac_ : 1);
 
 				if (0 != transformer.config_.n_experts_)
@@ -416,39 +414,23 @@ namespace cslm
 
 					matmul(transformer.state_.xb2_, transformer.state_.hb_, transformer.weights_.AsSpan<byte>(transformer.weights_.w2_[l]).Slice(moe_experts[e] * esize), empty_span, hidden_dim, dim, dotprod);
 
-					for (int i = 0; i < dim; ++i)
+                    for (int i = 0; i < dim; ++i)
 					{
 						x[i] += transformer.state_.xb2_[i] * moe_weights[e];
 					}
-				}
-			}
+                }
+            }
 			if (0 != (flags & (uint)ForwardFlags.FF_UPDATE_KV_ONLY))
 			{
 				// only update kv cache and don't output logits
 				return null;
 			}
 
-			// final rmsnorm
-			rmsnorm(x, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_final_weight_), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
+            // final rmsnorm
+            rmsnorm(x, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_final_weight_), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
 
-#if DEBUG
-Span<byte> wcls = transformer.weights_.AsSpan<byte>(transformer.weights_.wcls_);
-#endif
-#if DEBUG
-			for (int i = 0; i < wcls.Length; ++i)
-			{
-				Console.WriteLine("wcls[" + i + "] " + wcls[i]);
-			}
-#endif
-
-			// classifier into logits
-			matmul(transformer.state_.logits_, x, transformer.weights_.AsSpan<byte>(transformer.weights_.wcls_), empty_span, transformer.config_.dim_, transformer.config_.vocab_size_, dotprod);
-#if DEBUG
-			for(int i=0; i< transformer.state_.logits_.Length; ++i)
-			{
-				Console.WriteLine("logits[" + i + "] " + transformer.state_.logits_[i]);
-			}
-#endif
+            // classifier into logits
+            matmul(transformer.state_.logits_, x, transformer.weights_.AsSpan<byte>(transformer.weights_.wcls_), empty_span, transformer.config_.dim_, transformer.config_.vocab_size_, dotprod);
 			return transformer.state_.logits_;
 		}
 	}

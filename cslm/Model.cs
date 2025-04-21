@@ -2,6 +2,7 @@ using CommunityToolkit.HighPerformance;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace cslm
 {
@@ -20,7 +21,8 @@ namespace cslm
 				return false;
 			}
 			transformer_ = new Transformer();
-			get_config(context_size);
+			sampler_ = new Sampler();
+            get_config(context_size);
 			get_tokenizer();
 			get_weights();
 			if (!tokenizer_.check_vocab())
@@ -48,7 +50,13 @@ namespace cslm
 			transformer_.state_.Initialize(transformer_.config_);
 			transformer_.forward_ = Inference.forward;
 			transformer_.forward_(transformer_, 0, 0, 0);
-			return true;
+#if false
+			Console.WriteLine("logits");
+			for(int i=0; i<transformer_.state_.logits_.Length; ++i) {
+				Console.WriteLine("[{0}] {1}", i, transformer_.state_.logits_[i]);
+			}
+#endif
+            return true;
 		}
 
         private ulong kvcache_bandwidth(int kvbits, int pos) {
@@ -66,7 +74,7 @@ namespace cslm
 			sampler_.minp_ = context.pvalue_;
 			sampler_.random_.seed(context.seed_);
 
-			Stopwatch sw = new Stopwatch();
+            Stopwatch sw = new Stopwatch();
 			int steps = context.steps_ == 0 ? transformer_.config_.seq_len_ : context.steps_;
 			int pos_offset = 0;
             List<ushort> tokens = new List<ushort>();
@@ -81,18 +89,44 @@ namespace cslm
 				if(tokens.Count <= 0){
 					return;
 			}
-				int token = tokens[0];
+                string? env_tokens = Environment.GetEnvironmentVariable("CLSM_TOKENS");
+                //if (null != env_tokens)
+                {
+                    //int env_tokens_value = 0;
+                    //if(int.TryParse(env_tokens, out env_tokens_value) && 0<env_tokens_value)
+                    {
+                        for (int j = 0; j < tokens.Count; ++j)
+                        {
+							string s = Encoding.UTF8.GetString(tokenizer_.decode(tokens[j], tokens[j]));
+							Console.Write("[{0}:{1}]", s, tokens[j]);
+                        }
+						Console.WriteLine();
+                    }
+                }
+
+                int token = tokens[0];
 				int pos = 0;
 				int next;
-				ulong read_bytes = 0;
+                ulong read_bytes = 0;
 				float[]? logits_last = null;
-				while (pos < steps || steps < 0)
+                Console.WriteLine("[{0}] #{1:X}", pos, Util.CalcHash(transformer_.state_.logits_));
+                while (pos < steps || steps < 0)
                 {
 					// forward the transformer to get logits for the next token
 					ForwardFlags flags = pos < tokens.Count - 1 ? ForwardFlags.FF_UPDATE_KV_ONLY : ForwardFlags.FF_NONE;
 					float[] logits = transformer_.forward_(transformer_, token, pos + pos_offset, (uint)flags);
+#if true
+					if (null != logits)
+					{
+						Console.WriteLine("[{0}] #{1:X}", pos, Util.CalcHash(logits));
+					}
+					else
+					{
+                        Console.WriteLine("[{0}] #{1:X}", pos, Util.CalcHash(transformer_.state_.logits_));
+                    }
+					#endif
 
-                    read_bytes += transformer_.n_bandwidth_;
+						read_bytes += transformer_.n_bandwidth_;
 
                     read_bytes += kvcache_bandwidth(transformer_.state_.kvbits_, pos + pos_offset);
                     logits_last = logits;
@@ -120,6 +154,7 @@ namespace cslm
 					// print the token as string, decode it with the Tokenizer object
 					ReadOnlySpan<byte> piece = tokenizer_.decode(token, next);
 					pieces.AddRange(piece);
+					Console.Write(Encoding.UTF8.GetString(piece));
                     token = next;
                 }
 				sw.Stop();
@@ -128,8 +163,7 @@ namespace cslm
                 uint logits_hash = 0;
                 if (null != logits_last)
                 {
-					ReadOnlySpan<byte> logits = MemoryMarshal.Cast<float, byte>(logits_last);
-					logits_hash = System.IO.Hashing.XxHash32.HashToUInt32(logits);
+					logits_hash = Util.CalcHash(logits_last);
                 }
 				string str = string.Format("# {0} tokens: throughput: {1} tok/s; latency: {2} ms/tok; bandwidth: {3} GB/s; total {4} sec; #{5:X}",
 					pos,
@@ -308,7 +342,7 @@ namespace cslm
 
 			transformer_.weights_.rms_final_weight_ = tensors_.get_tensor("model.norm.weight", 0, DType.dt_f32, transformer_.config_.dim_, 0, 0, 0);
 
-			if (0 < tensors_.find("model.output.weight", 0))
+			if (tensors_.find("model.output.weight", 0)<0)
 			{
 				transformer_.weights_.wcls_ = transformer_.weights_.token_embedding_table_; // tied weights
 			}
@@ -316,7 +350,8 @@ namespace cslm
 			{
 				transformer_.weights_.wcls_ = tensors_.get_tensor("model.output.weight", 0, wtype, transformer_.config_.vocab_size_, transformer_.config_.dim_ / gsize, 0, 0);
 			}
-		}
+			transformer_.weights_.wcls_.print();
+        }
 
 		public void get_tokenizer()
 		{

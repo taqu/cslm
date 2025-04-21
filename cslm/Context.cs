@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Silk.NET.OpenCL;
 
 namespace cslm
 {
@@ -18,5 +19,11 @@ namespace cslm
 		public string input_;
 		public string perplexity_;
 		public string system_prompt_;
+
+
+		public void initialize()
+		{
+			CL.GetApi();
+        }
 	}
 }
