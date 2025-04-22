@@ -75,9 +75,9 @@ namespace cslm
             }
 
             // Set the kernel arguments (result, a, b)
-            int errNum = cl.SetKernelArg(kernel_, 0, (nuint)sizeof(nint), memObjects_[0]);
-            errNum |= cl.SetKernelArg(kernel_, 1, (nuint)sizeof(nint), memObjects_[1]);
-            errNum |= cl.SetKernelArg(kernel_, 2, (nuint)sizeof(nint), memObjects_[2]);
+            int errNum = cl.SetKernelArg(kernel_, 0, (nuint)sizeof(nint), ref memObjects_[0]);
+            errNum |= cl.SetKernelArg(kernel_, 1, (nuint)sizeof(nint), ref memObjects_[1]);
+            errNum |= cl.SetKernelArg(kernel_, 2, (nuint)sizeof(nint), ref memObjects_[2]);
 
             if (errNum != (int)ErrorCodes.Success)
             {

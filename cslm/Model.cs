@@ -1,28 +1,35 @@
 using CommunityToolkit.HighPerformance;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Text;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace cslm
 {
-	public struct Model
+	public class Model
 	{
+		public struct Result
+		{
+			public int tokens_;
+			public uint logits_hash_;
+			public ulong read_bytes_;
+			public double total_seconds_;
+			public string text_;
+		}
+
 		public Tensors tensors_;
 		public Transformer transformer_;
 		public Tokenizer tokenizer_;
 		public Sampler sampler_;
 
-		public bool initialize(string model, int context_size)
+		public async Task<bool> Initialize(string model, int context_size)
 		{
-			tensors_ = Tensors.OpenAsync(model).Result;
+			tensors_ = await Tensors.OpenAsync(model);
 			if (null == tensors_)
 			{
 				return false;
 			}
 			transformer_ = new Transformer();
 			sampler_ = new Sampler();
-            get_config(context_size);
+			get_config(context_size);
 			get_tokenizer();
 			get_weights();
 			if (!tokenizer_.check_vocab())
@@ -50,131 +57,133 @@ namespace cslm
 			transformer_.state_.Initialize(transformer_.config_);
 			transformer_.forward_ = Inference.forward;
 			transformer_.forward_(transformer_, 0, 0, 0);
-#if false
-			Console.WriteLine("logits");
-			for(int i=0; i<transformer_.state_.logits_.Length; ++i) {
-				Console.WriteLine("[{0}] {1}", i, transformer_.state_.logits_[i]);
-			}
-#endif
-            return true;
+			return true;
 		}
 
-        private ulong kvcache_bandwidth(int kvbits, int pos) {
+		private ulong kvcache_bandwidth(int kvbits, int pos)
+		{
 
-    int kv_dim = transformer_.config_.head_dim_ * transformer_.config_.n_kv_heads_;
-        int kv_len = transformer_.config_.seq_len_<=pos ? transformer_.config_.seq_len_ : pos + 1;
-	return (ulong)(2L * (kvbits / 8)* transformer_.config_.n_layers_* kv_dim * kv_len);
-}
+			int kv_dim = transformer_.config_.head_dim_ * transformer_.config_.n_kv_heads_;
+			int kv_len = transformer_.config_.seq_len_ <= pos ? transformer_.config_.seq_len_ : pos + 1;
+			return (ulong)(2L * (kvbits / 8) * transformer_.config_.n_layers_ * kv_dim * kv_len);
+		}
 
-		public void run(Context context)
+		public async Task<List<Result>> RunAsync(Context context)
+		{
+			return await Task<List<Result>>.Run(() => run(context));
+		}
+
+		public List<Result> run(Context context)
 		{
 			Debug.Assert(null != transformer_.forward_);
+			bool CLSM_TOKENS = false;
+			string? env_tokens = Environment.GetEnvironmentVariable("CLSM_TOKENS");
+			if (null != env_tokens)
+			{
+				int env_tokens_value = 0;
+				if (int.TryParse(env_tokens, out env_tokens_value))
+				{
+					CLSM_TOKENS = 0 < env_tokens_value;
+				}
+			}
+
 			sampler_.vocab_size_ = transformer_.config_.vocab_size_;
 			sampler_.temperature_ = context.temperature_;
 			sampler_.minp_ = context.pvalue_;
 			sampler_.random_.seed(context.seed_);
 
-            Stopwatch sw = new Stopwatch();
 			int steps = context.steps_ == 0 ? transformer_.config_.seq_len_ : context.steps_;
 			int pos_offset = 0;
-            List<ushort> tokens = new List<ushort>();
+			List<ushort> tokens = new List<ushort>();
 			List<byte> pieces = new List<byte>();
-			for (int i=0; i<context.sequences_; ++i)
+			List<Result> results = new List<Result>();
+			Stopwatch sw = new Stopwatch();
+			for (int i = 0; i < context.sequences_; ++i)
 			{
 				sw.Start();
 				tokens.Clear();
 
 				byte[] bytes = Encoding.UTF8.GetBytes(context.input_);
 				tokenizer_.encode(tokens, bytes, TokenizerFlags.TF_ENCODE_BOS);
-				if(tokens.Count <= 0){
-					return;
-			}
-                string? env_tokens = Environment.GetEnvironmentVariable("CLSM_TOKENS");
-                //if (null != env_tokens)
-                {
-                    //int env_tokens_value = 0;
-                    //if(int.TryParse(env_tokens, out env_tokens_value) && 0<env_tokens_value)
-                    {
-                        for (int j = 0; j < tokens.Count; ++j)
-                        {
-							string s = Encoding.UTF8.GetString(tokenizer_.decode(tokens[j], tokens[j]));
-							Console.Write("[{0}:{1}]", s, tokens[j]);
-                        }
-						Console.WriteLine();
-                    }
-                }
+				if (tokens.Count <= 0)
+				{
+					return results;
+				}
+				if (CLSM_TOKENS)
+				{
+					for (int j = 0; j < tokens.Count; ++j)
+					{
+						string s = Encoding.UTF8.GetString(tokenizer_.decode(tokens[j], tokens[j]));
+						Console.Write("[{0}:{1}]", s, tokens[j]);
+					}
+					Console.WriteLine();
+				}
 
-                int token = tokens[0];
+				int token = tokens[0];
 				int pos = 0;
 				int next;
-                ulong read_bytes = 0;
+				ulong read_bytes = 0;
 				float[]? logits_last = null;
-                Console.WriteLine("[{0}] #{1:X}", pos, Util.CalcHash(transformer_.state_.logits_));
-                while (pos < steps || steps < 0)
-                {
+				while (pos < steps || steps < 0)
+				{
 					// forward the transformer to get logits for the next token
 					ForwardFlags flags = pos < tokens.Count - 1 ? ForwardFlags.FF_UPDATE_KV_ONLY : ForwardFlags.FF_NONE;
 					float[] logits = transformer_.forward_(transformer_, token, pos + pos_offset, (uint)flags);
-#if true
-					if (null != logits)
+					read_bytes += transformer_.n_bandwidth_;
+
+					read_bytes += kvcache_bandwidth(transformer_.state_.kvbits_, pos + pos_offset);
+					logits_last = logits;
+
+					// advance the state machine
+					if (pos < tokens.Count - 1)
 					{
-						Console.WriteLine("[{0}] #{1:X}", pos, Util.CalcHash(logits));
+						// if we are still processing the input prompt, force the next prompt token
+						next = tokens[pos + 1];
 					}
 					else
 					{
-                        Console.WriteLine("[{0}] #{1:X}", pos, Util.CalcHash(transformer_.state_.logits_));
-                    }
-					#endif
-
-						read_bytes += transformer_.n_bandwidth_;
-
-                    read_bytes += kvcache_bandwidth(transformer_.state_.kvbits_, pos + pos_offset);
-                    logits_last = logits;
-
-                    // advance the state machine
-                    if (pos < tokens.Count - 1)
-                    {
-                        // if we are still processing the input prompt, force the next prompt token
-                        next = tokens[pos + 1];
-                    }
-                    else
-                    {
 						// otherwise sample the next token from the logits
 						next = Sampler.sample(sampler_, logits);
-                        Debug.Assert(0<=next);
+						Debug.Assert(0 <= next);
 
-                        // data-dependent terminating condition: the BOS token delimits sequences, EOS token ends the sequence, EOT token ends the turn
-                        if (next == tokenizer_.BOS_ID || next == tokenizer_.EOS_ID || next == tokenizer_.EOT_ID)
-                        {
-                            break;
-                        }
-                    }
-                    pos++;
+						// data-dependent terminating condition: the BOS token delimits sequences, EOS token ends the sequence, EOT token ends the turn
+						if (next == tokenizer_.BOS_ID || next == tokenizer_.EOS_ID || next == tokenizer_.EOT_ID)
+						{
+							break;
+						}
+					}
+					pos++;
 
 					// print the token as string, decode it with the Tokenizer object
 					ReadOnlySpan<byte> piece = tokenizer_.decode(token, next);
 					pieces.AddRange(piece);
-					Console.Write(Encoding.UTF8.GetString(piece));
-                    token = next;
-                }
+					token = next;
+				}
 				sw.Stop();
-				Console.WriteLine(Encoding.UTF8.GetString(pieces.AsSpan<byte>()));
-                // fold last token's logits into a hash for validation
-                uint logits_hash = 0;
-                if (null != logits_last)
-                {
+				// fold last token's logits into a hash for validation
+				uint logits_hash = 0;
+				if (null != logits_last)
+				{
 					logits_hash = Util.CalcHash(logits_last);
-                }
-				string str = string.Format("# {0} tokens: throughput: {1} tok/s; latency: {2} ms/tok; bandwidth: {3} GB/s; total {4} sec; #{5:X}",
-					pos,
-					pos / sw.Elapsed.TotalSeconds,
-					sw.Elapsed.TotalSeconds / pos,
-					((double)read_bytes / 1e9) / sw.Elapsed.TotalSeconds,
-					sw.Elapsed.TotalSeconds,
-					logits_hash);
-				Console.WriteLine(str);
-            }
-        }
+				}
+				Result result;
+				result.tokens_ = pos;
+				result.logits_hash_ = logits_hash;
+				result.read_bytes_ = read_bytes;
+				result.total_seconds_ = sw.Elapsed.TotalSeconds;
+				result.text_ = Encoding.UTF8.GetString(pieces.AsSpan<byte>());
+				results.Add(result);
+				//string str = string.Format("# {0} tokens: throughput: {1} tok/s; latency: {2} ms/tok; bandwidth: {3} GB/s; total {4} sec; #{5:X}",
+				//	pos,
+				//	pos / sw.Elapsed.TotalSeconds,
+				//	sw.Elapsed.TotalSeconds / pos,
+				//	((double)read_bytes / 1e9) / sw.Elapsed.TotalSeconds,
+				//	sw.Elapsed.TotalSeconds,
+				//	logits_hash);
+				//Console.WriteLine(str);
+			}
+			return results;
+		}
 
 		private static ulong count_bytes(Tensors tensors, string prefix, string? filter, out ulong out_params)
 		{
@@ -342,7 +351,7 @@ namespace cslm
 
 			transformer_.weights_.rms_final_weight_ = tensors_.get_tensor("model.norm.weight", 0, DType.dt_f32, transformer_.config_.dim_, 0, 0, 0);
 
-			if (tensors_.find("model.output.weight", 0)<0)
+			if (tensors_.find("model.output.weight", 0) < 0)
 			{
 				transformer_.weights_.wcls_ = transformer_.weights_.token_embedding_table_; // tied weights
 			}
@@ -351,7 +360,7 @@ namespace cslm
 				transformer_.weights_.wcls_ = tensors_.get_tensor("model.output.weight", 0, wtype, transformer_.config_.vocab_size_, transformer_.config_.dim_ / gsize, 0, 0);
 			}
 			transformer_.weights_.wcls_.print();
-        }
+		}
 
 		public void get_tokenizer()
 		{
@@ -364,5 +373,6 @@ namespace cslm
 
 			tokenizer_ = Tokenizer.initialize(tokens, scores, bos_id, eos_id, transformer_.config_.vocab_size_);
 		}
+
 	}
 }

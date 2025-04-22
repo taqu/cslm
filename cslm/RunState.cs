@@ -18,8 +18,8 @@ namespace cslm
         public float[] logits_; // output logits
                                 // kv cache
         public int kvbits_;        // 8 for fp8, 16 for fp16_; determines type of void* below
-        public Half[] key_cache_;   // (layer, seq_len, dim)
-        public Half[] value_cache_; // (layer, seq_len, dim)
+        public short[] key_cache_;   // (layer, seq_len, dim)
+        public short[] value_cache_; // (layer, seq_len, dim)
 
         public void Initialize(in Config config)
         {
@@ -42,8 +42,8 @@ namespace cslm
             //assert(s->kvbits == sizeof(kvtype_t) * 8);
 
             long cache_size = (long)config.n_layers_ * config.seq_len_ * kv_dim;
-            key_cache_ = new Half[cache_size];
-            value_cache_ = new Half[cache_size];
+            key_cache_ = new short[cache_size];
+            value_cache_ = new short[cache_size];
 		}
 	}
 }

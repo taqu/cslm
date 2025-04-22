@@ -1,21 +1,17 @@
 using CommunityToolkit.HighPerformance;
-using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 
 namespace cslm
 {
-	using kvtype_t = Half;
-
 	public static class Inference
 	{
-		public static kvtype_t fp82half(byte v)
+		public static ParallelOptions ParallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 1 };
+
+		public static Half fp82half(byte v)
 		{
 			ushort u = v;
 			u <<= 8;
-			kvtype_t h = BitConverter.UInt16BitsToHalf(u);
+			Half h = BitConverter.UInt16BitsToHalf(u);
 			return h;
 		}
 
@@ -47,7 +43,7 @@ namespace cslm
 			float c = 0.0f;
 			for (int j = 0; j < n; ++j)
 			{
-                float y = (float)fp82half((byte)r[j]) * x[j] - c;
+				float y = (float)fp82half((byte)r[j]) * x[j] - c;
 				float t = val + y;
 				c = (t - val) - y;
 				val = t;
@@ -55,9 +51,58 @@ namespace cslm
 			return val;
 		}
 
-        public static float dotprod_gf4(Span<byte> w, int n, int i, float[] x)
+		public static float dotprod_gf4(Span<byte> w, int n, int i, float[] x)
 		{
 			Span<uint> r = MemoryMarshal.Cast<byte, uint>(w).Slice(i * n / 8);
+			float val = 0.0f;
+			float c = 0.0f;
+			for (int j = 0; j < n; j += 8)
+			{
+				uint wg = r[j / 8];
+				for (int k = 0; k < 8; ++k)
+				{
+					float y = gf4_ff(wg, k) * x[j + k];
+					float t = val + y;
+					c = (t - val) - y;
+					val = t;
+				}
+			}
+			return val;
+		}
+
+		public unsafe static float dotprodp_fp16(byte* w, int n, int i, float[] x)
+		{
+			Half* r = (Half*)w + i + n;
+			float val = 0.0f;
+			float c = 0.0f;
+			for (int j = 0; j < n; ++j)
+			{
+				float y = (float)r[j] * x[j];
+				float t = val + y;
+				c = (t - val) - y;
+				val = t;
+			}
+			return val;
+		}
+
+		public unsafe static float dotprodp_fp8(byte* w, int n, int i, float[] x)
+		{
+			byte* r = w + i * n;
+			float val = 0.0f;
+			float c = 0.0f;
+			for (int j = 0; j < n; ++j)
+			{
+				float y = (float)fp82half((byte)r[j]) * x[j] - c;
+				float t = val + y;
+				c = (t - val) - y;
+				val = t;
+			}
+			return val;
+		}
+
+		public unsafe static float dotprodp_gf4(byte* w, int n, int i, float[] x)
+		{
+			uint* r = (uint*)w + i * n / 8;
 			float val = 0.0f;
 			float c = 0.0f;
 			for (int j = 0; j < n; j += 8)
@@ -86,18 +131,18 @@ namespace cslm
 
 			float c;
 
-            if (ln)
+			if (ln)
 			{
 				c = 0.0f;
 				for (int i = 0; i < size; ++i)
 				{
 					float y = x[i];
-                    float t = mean + y;
-                    c = (t - mean) - y;
-                    mean = t;
+					float t = mean + y;
+					c = (t - mean) - y;
+					mean = t;
 
-                }
-                mean /= size;
+				}
+				mean /= size;
 			}
 
 			// calculate sum of squared deltas
@@ -105,10 +150,10 @@ namespace cslm
 			c = 0.0f;
 			for (int i = 0; i < size; ++i)
 			{
-                float y = (x[i] - mean) * (x[i] - mean);
-                float t = ss + y;
-                c = (t - ss) - y;
-                ss = t;
+				float y = (x[i] - mean) * (x[i] - mean);
+				float t = ss + y;
+				c = (t - ss) - y;
+				ss = t;
 			}
 
 			float var = ss / size;
@@ -122,11 +167,13 @@ namespace cslm
 		}
 
 		public delegate float Dotprod(Span<byte> w, int n, int i, float[] x);
+		public unsafe delegate float Dotprodp(byte* w, int n, int i, float[] x);
 
-		public static void matmul(float[] xout, float[] x, Span<byte> w, Span<float> b, int n, int d, Dotprod dotprod)
+		public unsafe static void matmul(float[] xout, float[] x, Span<byte> w, Span<float> b, int n, int d, Dotprod dotprod)
 		{
 			// W (d,n) @ x (n,) -> xout (d,)
 			// by far the most amount of time is spent inside this little function
+#if false
 			for (int i = 0; i < d; ++i)
 			{
 				float val = dotprod(w, n, i, x);
@@ -136,6 +183,38 @@ namespace cslm
 				}
 				xout[i] = val;
 			}
+#else
+			int length = b.Length;
+			fixed (byte* pw = w)
+			fixed (float* pb = b)
+			{
+				Dotprodp dotprodp;
+				if (dotprod == dotprod_fp8)
+				{
+					dotprodp = dotprodp_fp8;
+				}
+				else if (dotprod == dotprod_fp16)
+				{
+					dotprodp = dotprodp_fp16;
+				}
+				else
+				{
+					dotprodp = dotprodp_gf4;
+				}
+				byte* ppw = pw;
+				float* ppb = pb;
+				Parallel.For(0, d, ParallelOptions, i =>
+			{
+				float val = dotprodp(ppw, n, i, x);
+				if (0 < length)
+				{
+					val += ppb[i];
+				}
+				xout[i] = val;
+
+			});
+			}
+#endif
 		}
 
 		public static void rope(float[] vec, int d, int head_dim, int pos, float theta, int rotary_dim)
@@ -155,7 +234,7 @@ namespace cslm
 			}
 		}
 
-		public static void attn(Span<float> xout, Span<float> atth, Span<float> qh, Span<kvtype_t> kh, Span<kvtype_t> vh, int head_dim, int kv_dim, int kv_len)
+		public static void attn(Span<float> xout, Span<float> atth, Span<float> qh, Span<short> kh, Span<short> vh, int head_dim, int kv_dim, int kv_len)
 		{
 			float score_max = float.MinValue;
 			float sqrt_head_dim = MathF.Sqrt(head_dim);
@@ -166,7 +245,7 @@ namespace cslm
 				float score = 0.0f;
 				for (int j = 0; j < head_dim; ++j)
 				{
-					score += qh[j] * (float)kh[t * kv_dim + j];
+					score += qh[j] * (float)BitConverter.Int16BitsToHalf(kh[t * kv_dim + j]);
 				}
 				score /= sqrt_head_dim;
 				score_max = (score_max < score) ? score : score_max;
@@ -187,7 +266,45 @@ namespace cslm
 				float res = 0.0f;
 				for (int t = 0; t < kv_len; ++t)
 				{
-					res += (atth[t] / score_sum) * (float)vh[t * kv_dim + j];
+					res += (atth[t] / score_sum) * (float)BitConverter.Int16BitsToHalf(vh[t * kv_dim + j]);
+				}
+				xout[j] = res;
+			}
+		}
+
+		public unsafe static void attnp(float* xout, float* atth, float* qh, short* kh, short* vh, int head_dim, int kv_dim, int kv_len)
+		{
+			float score_max = float.MinValue;
+			float sqrt_head_dim = MathF.Sqrt(head_dim);
+
+			// calculate attention scores as dot products of q and k; also track score max for this head
+			for (int t = 0; t < kv_len; ++t)
+			{
+				float score = 0.0f;
+				for (int j = 0; j < head_dim; ++j)
+				{
+					score += qh[j] * (float)BitConverter.Int16BitsToHalf(kh[t * kv_dim + j]);
+				}
+				score /= sqrt_head_dim;
+				score_max = (score_max < score) ? score : score_max;
+				atth[t] = score;
+			}
+
+			// softmax the scores to get attention weights over [0..kv_len)
+			float score_sum = 0.0f;
+			for (int t = 0; t < kv_len; ++t)
+			{
+				atth[t] = MathF.Exp(atth[t] - score_max);
+				score_sum += atth[t];
+			}
+
+			// mix values with attention weights
+			for (int j = 0; j < head_dim; ++j)
+			{
+				float res = 0.0f;
+				for (int t = 0; t < kv_len; ++t)
+				{
+					res += (atth[t] / score_sum) * (float)BitConverter.Int16BitsToHalf(vh[t * kv_dim + j]);
 				}
 				xout[j] = res;
 			}
@@ -328,8 +445,8 @@ namespace cslm
 				bqkv = 0 < bqkv_len ? bqkv.Slice(kv_dim) : empty_span;
 				matmul(transformer.state_.v_, transformer.state_.xb_, wv, bqkv, dim, kv_dim, dotprod);
 
-                // some models require clipping qkv values
-                for (int i = 0; i < q_dim; ++i)
+				// some models require clipping qkv values
+				for (int i = 0; i < q_dim; ++i)
 				{
 					transformer.state_.q_[i] = clip(transformer.state_.q_[i], transformer.config_.qkv_clip_);
 				}
@@ -339,20 +456,20 @@ namespace cslm
 					transformer.state_.v_[i] = clip(transformer.state_.v_[i], transformer.config_.qkv_clip_);
 				}
 
-                // RoPE relative positional encoding: complex-valued rotate q and k in each head
-                rope(transformer.state_.q_, q_dim, transformer.config_.head_dim_, pos, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
+				// RoPE relative positional encoding: complex-valued rotate q and k in each head
+				rope(transformer.state_.q_, q_dim, transformer.config_.head_dim_, pos, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
 				rope(transformer.state_.k_, kv_dim, transformer.config_.head_dim_, pos, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
 
-                // key and value point to the kv cache
-                int loff = l * transformer.config_.seq_len_ * kv_dim; // kv cache layer offset for convenience
-				Span<kvtype_t> kb = transformer.state_.key_cache_.AsSpan().Slice(loff);
-				Span<kvtype_t> vb = transformer.state_.value_cache_.AsSpan().Slice(loff);
+				// key and value point to the kv cache
+				int loff = l * transformer.config_.seq_len_ * kv_dim; // kv cache layer offset for convenience
+				Span<short> kb = transformer.state_.key_cache_.AsSpan().Slice(loff);
+				Span<short> vb = transformer.state_.value_cache_.AsSpan().Slice(loff);
 
 				// update kv cache
 				for (int i = 0; i < kv_dim; ++i)
 				{
-					kb[kv_pos * kv_dim + i] = (kvtype_t)transformer.state_.k_[i];
-					vb[kv_pos * kv_dim + i] = (kvtype_t)transformer.state_.v_[i];
+					kb[kv_pos * kv_dim + i] = BitConverter.HalfToInt16Bits((Half)transformer.state_.k_[i]);
+					vb[kv_pos * kv_dim + i] = BitConverter.HalfToInt16Bits((Half)transformer.state_.v_[i]);
 				}
 
 				// rotate sink tokens forward to keep pace with non-sink tokens
@@ -360,26 +477,56 @@ namespace cslm
 				{
 					for (int i = 0; i < kv_dim; ++i)
 					{
-						transformer.state_.k_[i] = (float)kb[r * kv_dim + i];
+						transformer.state_.k_[i] = (float)BitConverter.Int16BitsToHalf(kb[r * kv_dim + i]);
 					}
 
 					rope(transformer.state_.k_, kv_dim, transformer.config_.head_dim_, 1, transformer.config_.rope_theta_, transformer.config_.rotary_dim_);
 
 					for (int i = 0; i < kv_dim; ++i)
 					{
-						kb[r * kv_dim + i] = (kvtype_t)transformer.state_.k_[i];
+						kb[r * kv_dim + i] = BitConverter.HalfToInt16Bits((Half)transformer.state_.k_[i]);
 					}
 				}
 				// multihead attention. iterate over all heads
+#if false
 				for (int h = 0; h < transformer.config_.n_heads_; ++h)
 				{
 					Span<float> qh = transformer.state_.q_.AsSpan(h * transformer.config_.head_dim_);
 					Span<float> atth = transformer.state_.att_.AsSpan(h * transformer.config_.seq_len_);
-					Span<kvtype_t> kh = kb.Slice((h / kv_mul) * transformer.config_.head_dim_);
-					Span<kvtype_t> vh = vb.Slice((h / kv_mul) * transformer.config_.head_dim_);
+					Span<short> kh = kb.Slice((h / kv_mul) * transformer.config_.head_dim_);
+					Span<short> vh = vb.Slice((h / kv_mul) * transformer.config_.head_dim_);
 
 					attn(transformer.state_.xb2_.AsSpan(h * transformer.config_.head_dim_), atth, qh, kh, vh, transformer.config_.head_dim_, kv_dim, kv_len);
 				}
+#else
+				unsafe
+				{
+					int head_dim = transformer.config_.head_dim_;
+					int seq_len = transformer.config_.seq_len_;
+					fixed (float* pxb2 = transformer.state_.xb2_)
+					fixed (float* qh = transformer.state_.q_)
+					fixed (float* atth = transformer.state_.att_)
+					fixed (short* pkb = kb)
+					fixed (short* pvb = vb)
+					{
+						float* ppxb2 = pxb2;
+						float* pqh = qh;
+						float* patth = atth;
+						short* ppkb = pkb;
+						short* ppvb = pvb;
+						Parallel.For(0, transformer.config_.n_heads_, ParallelOptions, h =>
+						{
+							ppxb2 = ppxb2 + h * head_dim;
+							pqh = pqh + h * head_dim; ;
+							patth = patth + h * seq_len;
+							int kv_offset = (h / kv_mul) * head_dim;
+							short* kh = ppkb + kv_offset;
+							short* vh = ppvb + kv_offset;
+							attnp(ppxb2, patth, pqh, kh, vh, head_dim, kv_dim, kv_len);
+						});
+					}
+				}
+#endif
 
 				// final matmul to get the output of the attention
 				// TODO: we're using hb as a temporary storage, hacky
@@ -391,13 +538,13 @@ namespace cslm
 					x[i] += transformer.state_.hb_[i];
 				}
 
-                if (!transformer.config_.norm_par_)
+				if (!transformer.config_.norm_par_)
 				{
 					// ffn rmsnorm
 					rmsnorm(transformer.state_.xb_, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_ffn_weight_[l]), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
-                }
+				}
 
-                Span<float> moe_weights = transformer.state_.exp_.AsSpan(transformer.config_.n_experts_);
+				Span<float> moe_weights = transformer.state_.exp_.AsSpan(transformer.config_.n_experts_);
 				Span<int> moe_experts = MemoryMarshal.Cast<float, int>(moe_weights).Slice(0 != transformer.config_.n_experts_ac_ ? transformer.config_.n_experts_ac_ : 1);
 
 				if (0 != transformer.config_.n_experts_)
@@ -438,23 +585,23 @@ namespace cslm
 
 					matmul(transformer.state_.xb2_, transformer.state_.hb_, transformer.weights_.AsSpan<byte>(transformer.weights_.w2_[l]).Slice(moe_experts[e] * esize), empty_span, hidden_dim, dim, dotprod);
 
-                    for (int i = 0; i < dim; ++i)
+					for (int i = 0; i < dim; ++i)
 					{
 						x[i] += transformer.state_.xb2_[i] * moe_weights[e];
 					}
-                }
-            }
+				}
+			}
 			if (0 != (flags & (uint)ForwardFlags.FF_UPDATE_KV_ONLY))
 			{
 				// only update kv cache and don't output logits
 				return null;
 			}
 
-            // final rmsnorm
-            rmsnorm(x, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_final_weight_), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
+			// final rmsnorm
+			rmsnorm(x, x, transformer.weights_.AsSpan<float>(transformer.weights_.rms_final_weight_), dim, transformer.config_.norm_eps_, transformer.config_.norm_ln_);
 
-            // classifier into logits
-            matmul(transformer.state_.logits_, x, transformer.weights_.AsSpan<byte>(transformer.weights_.wcls_), empty_span, transformer.config_.dim_, transformer.config_.vocab_size_, dotprod);
+			// classifier into logits
+			matmul(transformer.state_.logits_, x, transformer.weights_.AsSpan<byte>(transformer.weights_.wcls_), empty_span, transformer.config_.dim_, transformer.config_.vocab_size_, dotprod);
 			return transformer.state_.logits_;
 		}
 	}
