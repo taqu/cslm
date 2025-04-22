@@ -1,5 +1,585 @@
+
+half fp8_e5m2_ff(uchar v)
+{
+	half h = as_half(((ushort)v) << 8);
+	return h;
+}
+
+float embed_uchar(uchar* weight, int idx)
+{
+    return fp8_e5m2_ff(weight[idx]);
+}
+
+float embed_half(half* weight, int idx)
+{
+    return float(weight[idx]);
+}
+
+float embed_float(float* weight, int idx)
+{
+    return float(weight[idx]);
+}
+
+__kernel void kernel_embed_uchar(float* o, uchar* weight, int token, int n)
+{
+	int i = get_global_id(0);
+	assert(i < n);
+
+	o[i] = embed_uchar(weight, token * n + i);
+}
+
+__kernel void kernel_embed_half(float* o, half* weight, int token, int n)
+{
+	int i = get_global_id(0);
+	assert(i < n);
+
+	o[i] = embed_half(weight, token * n + i);
+}
+
+__kernel void kernel_embed_float(float* o, float* weight, int token, int n)
+{
+	int i = get_global_id(0);
+	assert(i < n);
+
+	o[i] = embed_float(weight, token * n + i);
+}
+
+__kernel void kernel_rotate_sink_uchar(uint64_t, int kvd, uchar* key_cache, int head_dim, int kv_sink, float theta_log2, int seq_len, int rotary_dim)
+{
+	int i = get_global_id(0) * 2;
+	assert(i < kv_sink * kvd);
+
+	int l = blockIdx.y;
+
+	int j_head = i % head_dim;
+	float freq = j_head >= rotary_dim ? 0.f : exp2f(-theta_log2 * (float)j_head / (float)rotary_dim);
+
+	// rotate sink tokens forward to keep pace with non-sink tokens
+	float fcr, fci;
+	sincosf(freq, &fci, &fcr);
+
+	size_t loff = (size_t)l * seq_len * kvd;
+	uchar* kb = key_cache + loff;
+
+	// note: k layout is transposed / tiled to improve attn_score performance
+	int t = i / kvd;
+	int k = i % kvd;
+	int o = t * 16 + seq_len * (k / 16) * 16 + (k % 16);
+
+	float v0 = float(kb[o + 0]);
+	float v1 = float(kb[o + 1]);
+
+	float r0 = v0 * fcr - v1 * fci;
+	float r1 = v0 * fci + v1 * fcr;
+
+	kb[o + 0] = uchar(r0);
+	kb[o + 1] = uchar(r1);
+}
+
+__kernel void kernel_rotate_sink_half(uint64_t, int kvd, half* key_cache, int head_dim, int kv_sink, float theta_log2, int seq_len, int rotary_dim)
+{
+	int i = get_global_id(0) * 2;
+	assert(i < kv_sink * kvd);
+
+	int l = blockIdx.y;
+
+	int j_head = i % head_dim;
+	float freq = j_head >= rotary_dim ? 0.f : exp2f(-theta_log2 * (float)j_head / (float)rotary_dim);
+
+	// rotate sink tokens forward to keep pace with non-sink tokens
+	float fcr, fci;
+	sincosf(freq, &fci, &fcr);
+
+	size_t loff = (size_t)l * seq_len * kvd;
+	half* kb = key_cache + loff;
+
+	// note: k layout is transposed / tiled to improve attn_score performance
+	int t = i / kvd;
+	int k = i % kvd;
+	int o = t * 16 + seq_len * (k / 16) * 16 + (k % 16);
+
+	float v0 = float(kb[o + 0]);
+	float v1 = float(kb[o + 1]);
+
+	float r0 = v0 * fcr - v1 * fci;
+	float r1 = v0 * fci + v1 * fcr;
+
+	kb[o + 0] = half(r0);
+	kb[o + 1] = half(r1);
+}
+
+__device__ inline float gelu(float x) {
+	return 0.5f * x * (1.0f + tanhf(0.797885f * (x + 0.044715f * x * x * x)));
+}
+
+__device__ inline float silu(float x) {
+	return x / (1.0f + expf(-x));
+}
+
+__device__ static void moe_gate_warp(float* moe_weights, int* moe_experts, float* weights, int experts, int active) {
+	int i = threadIdx.x;
+
+	// (unscaled) softmax across experts
+	float w = (i < experts) ? weights[i] : -FLT_MAX;
+	float max_val = warpreduce_max(w);
+	w = expf(w - max_val);
+
+	// weight in top 24 bits, index in bottom 8
+	int wi = (__float_as_int(w) & 0xffffff00) | i;
+
+	// top k within warp
+	float sumw = 0.f;
+	int acti = -1;
+
+	for (int k = 0; k < active; ++k) {
+		int maxi = warpreduce_maxi(wi);
+
+		sumw += __int_as_float(maxi);
+
+		// keeps top weight in thread k, clears weight for thread with max thread to avoid re-selection
+		acti = (i == k) ? maxi : acti;
+		wi = (wi == maxi) ? 0 : wi;
+	}
+
+	// write normalized weights
+	if (i < active) {
+		assert(acti >= 0);
+
+		moe_experts[i] = acti & 0xff;
+		moe_weights[i] = __int_as_float(acti) / sumw;
+	}
+}
+
+__device__ inline float4 attn_load4(half* p) {
+	ablock<__half2_raw, 2> h = *(ablock<__half2_raw, 2>*)p;
+	float2 h0 = __half22float2(h.v[0]), h1 = __half22float2(h.v[1]);
+	return {h0.x, h0.y, h1.x, h1.y};
+}
+
+__device__ inline float4 attn_load4(__nv_fp8_e5m2* p) {
+	return fp8x4_e5m2_ff(*(__nv_fp8x4_e5m2*)p);
+}
+
+template <typename KVT>
+__device__ inline float attn_score(KVT* kht, float* qh, int head_dim, int seq_len, int t, int off) {
+	float score = 0.0f;
+	for (int j = 0; j < head_dim; j += 16) {
+		float4 kk = attn_load4(&kht[j * seq_len + t * 16 + off]);
+		float4 qq = *(float4*)&qh[j + off];
+		score += kk.x * qq.x;
+		score += kk.y * qq.y;
+		score += kk.z * qq.z;
+		score += kk.w * qq.w;
+	}
+
+	return score;
+}
+
+template <typename KVT>
+__device__ inline float attn_warpdot(KVT* val, float* atth, int kv_len) {
+	int kv_len4 = kv_len & ~3;
+	int lane = threadIdx.x % warpSize;
+
+	float res = 0.0f;
+	float sum = 0.0f;
+	for (int t = lane * 4; t < kv_len4; t += warpSize * 4) {
+		float4 vv = attn_load4(&val[t]);
+		float4 aa = *(float4*)&atth[t];
+		res += vv.x * aa.x;
+		res += vv.y * aa.y;
+		res += vv.z * aa.z;
+		res += vv.w * aa.w;
+		sum += aa.x + aa.y + aa.z + aa.w;
+	}
+
+	if (kv_len4 + lane < kv_len) {
+		float a = atth[kv_len4 + lane];
+		res += a * float(val[kv_len4 + lane]);
+		sum += a;
+	}
+
+	res = warpreduce_sum(res);
+	sum = warpreduce_sum(sum);
+
+	return res / sum;
+}
+
+__device__ static void softmax(float* xout, float* x, int size) {
+	int i = threadIdx.x;
+
+	// find max value per thread (for numerical stability)
+	float max_val = -FLT_MAX;
+	for (int j = i; j < size; j += blockDim.x) {
+		max_val = max(max_val, x[j]);
+	}
+
+	// max across threads in block
+	max_val = blockreduce_max(max_val);
+
+	// exp per thread
+	for (int j = i; j < size; j += blockDim.x) {
+		xout[j] = expf(x[j] - max_val);
+	}
+}
+
+template <typename T>
+__device__ static float rmsnorm(T* o, float* x, float* weight, int size, float eps, bool ln) {
+	int i = threadIdx.x;
+	int blockSize = blockDim.x;
+
+	float mean = 0.0f;
+	if (ln) {
+		// calculate sum (per thread)
+		float sum = 0.0f;
+		for (int j = i; j < size; j += blockSize) {
+			sum += x[j];
+		}
+
+		// sum across threads in block
+		mean = blockreduce_sum(sum) / size;
+	}
+
+	// calculate sum of squares (per thread)
+	float ss = 0.0f;
+	for (int j = i * 2; j < size; j += blockSize * 2) {
+		float2 xx = *(float2*)&x[j];
+		float2 ww = *(float2*)&weight[j];
+		float v0 = xx.x - mean;
+		float v1 = xx.y - mean;
+		ss += v0 * v0;
+		ss += v1 * v1;
+		*(ablock<T, 2>*)&o[j] = { v0 * ww.x, v1 * ww.y };
+	}
+
+	// sum across threads in block
+	ss = blockreduce_sum(ss);
+
+	// caller is responsible for normalization
+	return rsqrtf(ss / size + eps);
+}
+
+__device__ static void syncgrid() {
+	volatile unsigned int* barrier = &cooperative_groups::details::get_grid_workspace()->barrier;
+
+	if (threadIdx.x == 0) {
+		unsigned int nb = 1;
+		if (blockIdx.x == 0) {
+			nb = 0x80000000 - (gridDim.x - 1);
+		}
+
+		unsigned int old_arrive;
+		asm volatile("atom.add.release.gpu.u32 %0,[%1],%2;" : "=r"(old_arrive) : _CG_ASM_PTR_CONSTRAINT(barrier), "r"(nb) : "memory");
+
+		unsigned int current_arrive;
+		do {
+			asm volatile("ld.acquire.gpu.u32 %0,[%1];" : "=r"(current_arrive) : _CG_ASM_PTR_CONSTRAINT(barrier) : "memory");
+		} while (((old_arrive ^ current_arrive) & 0x80000000) == 0);
+	}
+
+	__syncthreads();
+}
+
+template <typename T, typename KVT>
+struct CoopArgs {
+	uint64_t bw;
+	uint64_t* perfstats;
+
+	float* x;
+	float* hb;
+	float* q;
+	float* att;
+
+	KVT* key_cache;
+	KVT* val_cache;
+
+	int n_layers;
+
+	int dim;
+	int hidden_dim;
+	int head_dim;
+	int n_heads;
+	int n_kv_heads;
+	int n_experts;
+	int n_experts_ac;
+	int seq_len;
+	int rotary_dim;
+
+	bool norm_ln;
+	bool act_gelu;
+
+	int kv_len;
+	int kv_pos;
+	int pos;
+
+	float norm_eps;
+	float theta_log2;
+	float qkv_clip;
+};
+
+__device__ static void coopstage(uint64_t* stats, int stage) {
+	__shared__ uint64_t lastt;
+
+	if (stats && blockIdx.x == 0 && threadIdx.x == 0) {
+		uint64_t t;
+		asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+
+		if (stage >= 0) {
+			stats[stage] += t - lastt;
+		}
+		lastt = t;
+	}
+}
+
+template <typename T, typename KVT, typename AT>
+__global__ __launch_bounds__(1024, 1) static void kernel_forward(const __grid_constant__ CoopArgs<T, KVT> args) {
+	extern __shared__ char smem[];
+	__shared__ float rmsscale;
+
+	__shared__ float moe_weights[32];
+	__shared__ int moe_experts[32];
+
+	AT* xs = (AT*)smem;
+
+	int dim = args.dim;
+	int hidden_dim = args.hidden_dim;
+	int head_dim = args.head_dim;
+
+	int kv_mul = args.n_heads / args.n_kv_heads;
+	int q_dim = args.head_dim * args.n_heads;
+	int kv_dim = args.head_dim * args.n_kv_heads;
+
+	const int IK = 4; // K consecutive warps per block, groups of K are interleaved across SMs for better work distribution
+	int io = blockIdx.x * IK + (threadIdx.x / warpSize % IK) + gridDim.x * IK * (threadIdx.x / warpSize / IK);
+	int ib = (gridDim.x * blockDim.x) / warpSize;
+
+	// dummy moe weights for non-moe models; will be overwritten by moe gate
+	moe_weights[0] = 1.f;
+	moe_experts[0] = 0;
+
+	coopstage(args.perfstats, -1); // init timing
+
+	static __device__ int badsoftmax = 0;
+
+	for (int l = 0; l < args.n_layers; ++l) {
+		const CoopLayer<T>* L = (const CoopLayer<T>*)&cooplayers[l];
+
+		if (blockIdx.x == 0 && threadIdx.x < warpSize) {
+			badsoftmax = 0;
+		}
+
+		// pre-attention rmsnorm (into shared memory)
+		rmsscale = rmsnorm(xs, args.x, L->rms_att_weight, dim, args.norm_eps, args.norm_ln);
+
+		size_t loff = (size_t)l * args.seq_len * kv_dim; // kv cache layer offset for convenience
+		KVT* keyb = args.key_cache + loff;
+		KVT* valb = args.val_cache + loff;
+
+		// qkv matmul + RoPE encoding + update KV cache
+		for (int j = io * 2; j < q_dim + kv_dim * 2; j += ib * 2) {
+			T* w = j < q_dim ? L->wq : (j < q_dim + kv_dim ? L->wk : L->wv);
+			int k = j < q_dim ? j : (j < q_dim + kv_dim ? j - q_dim : j - q_dim - kv_dim);
+
+			float v0 = matmul_warppar(xs, w, k + 0, dim) * rmsscale;
+			float v1 = matmul_warppar(xs, w, k + 1, dim) * rmsscale;
+
+			if (L->bqkv) {
+				v0 += L->bqkv[j + 0];
+				v1 += L->bqkv[j + 1];
+			}
+
+			v0 = min(max(v0, -args.qkv_clip), args.qkv_clip);
+			v1 = min(max(v1, -args.qkv_clip), args.qkv_clip);
+
+			if (threadIdx.x % warpSize == 0) {
+				int j_head = j % head_dim;
+				float freq = j_head >= args.rotary_dim ? 0.f : exp2f(-args.theta_log2 * (float)j_head / (float)args.rotary_dim);
+				float fcr, fci;
+				sincosf(args.pos * freq, &fci, &fcr);
+
+				if (j < q_dim) {
+					args.q[k + 0] = v0 * fcr - v1 * fci;
+					args.q[k + 1] = v0 * fci + v1 * fcr;
+				} else if (j < q_dim + kv_dim) {
+					// note: k layout is transposed / tiled to improve attn_score performance
+					int off = args.kv_pos * 16 + args.seq_len * (k / 16) * 16 + (k % 16);
+					keyb[off + 0] = KVT(v0 * fcr - v1 * fci);
+					keyb[off + 1] = KVT(v0 * fci + v1 * fcr);
+				} else {
+					// note: v layout is transposed (we store all positions for a given head contiguously) to improve attn_mix performance
+					valb[args.kv_pos + args.seq_len * (k + 0)] = KVT(v0);
+					valb[args.kv_pos + args.seq_len * (k + 1)] = KVT(v1);
+				}
+			}
+		}
+
+		__syncthreads(); // TODO: unclear why this is needed for determinism
+		syncgrid();
+		coopstage(args.perfstats, 0);
+
+		// attention score
+		int kv_lent = (args.kv_len + 7) / 8;
+
+		for (int j = io; j < kv_lent * args.n_heads; j += ib) {
+			int h = j % args.n_heads;
+			int kvh = h / kv_mul;
+			int t = (j / args.n_heads) * 8 + (threadIdx.x % warpSize) / 4;
+
+			unsigned active = __ballot_sync(0xffffffff, t < args.kv_len);
+
+			if (t < args.kv_len) {
+				float* qh = args.q + h * head_dim;
+				KVT* kh = keyb + kvh * head_dim * args.seq_len;
+				float* atth = args.att + h * args.seq_len * 2;
+
+				float score = attn_score(kh, qh, head_dim, args.seq_len, t, 4 * (threadIdx.x % 4));
+
+				// reduce score across threads in warp; every 4 threads are processing the same output score
+				score += __shfl_xor_sync(active, score, 2);
+				score += __shfl_xor_sync(active, score, 1);
+				score /= sqrtf(head_dim);
+
+				atth[t] = expf(score);
+				atth[t + args.seq_len] = score;
+
+				// to reduce latency we prefer computing softmax without the numeric stabilization, which is safe if all inputs are small
+				if (fabsf(score) > 40) {
+					badsoftmax = 1;
+				}
+			}
+		}
+
+		syncgrid();
+		coopstage(args.perfstats, 1);
+
+		if (badsoftmax) {
+			// attention softmax
+			if (blockIdx.x < args.n_heads) {
+				int h = blockIdx.x;
+				float* atth = args.att + h * args.seq_len * 2;
+
+				softmax(atth, atth + args.seq_len, args.kv_len);
+			}
+
+			syncgrid();
+			coopstage(args.perfstats, 2);
+		}
+
+		// attention mix
+		for (int j = io; j < q_dim; j += ib) {
+			int h = j / head_dim;
+			int kvh = h / kv_mul;
+			int j_head = j % head_dim;
+
+			float* atth = args.att + h * args.seq_len * 2;
+			KVT* vh = valb + kvh * head_dim * args.seq_len;
+			KVT* val = vh + j_head * args.seq_len;
+
+			float res = attn_warpdot(val, atth, args.kv_len);
+
+			if (threadIdx.x % warpSize == 0) {
+				args.q[j] = res;
+			}
+		}
+
+		syncgrid();
+		coopstage(args.perfstats, 3);
+
+		// attention output
+		for (int j = io; j < dim; j += ib) {
+			float val = matmul_warppar(args.q, L->wo, j, q_dim);
+
+			if (threadIdx.x % warpSize == 0) {
+				args.x[j] += val;
+			}
+		}
+
+		__syncthreads(); // TODO: unclear why this is needed for determinism
+		syncgrid();
+		coopstage(args.perfstats, 4);
+
+		// post-attention rmsnorm (into shared memory)
+		if (L->rms_ffn_weight) {
+			rmsscale = rmsnorm(xs, args.x, L->rms_ffn_weight, dim, args.norm_eps, args.norm_ln);
+		}
+
+		// moegate
+		if (args.n_experts) {
+			__shared__ float exp[32];
+			int j = threadIdx.x / warpSize;
+
+			if (j < args.n_experts) {
+				float val = matmul_warppar(xs, L->moegate, j, dim) * rmsscale;
+
+				exp[j] = val;
+			}
+
+			__syncthreads();
+
+			if (threadIdx.x < warpSize) {
+				moe_gate_warp(moe_weights, moe_experts, exp, args.n_experts, args.n_experts_ac);
+			}
+
+			__syncthreads();
+		}
+
+		// F.silu(self.w1(x)) * self.w3(x)
+		for (int j = io; j < hidden_dim * args.n_experts_ac; j += ib) {
+			int je = (j % hidden_dim) + moe_experts[j / hidden_dim] * hidden_dim;
+			float v1 = matmul_warppar(xs, L->w1, je, dim) * rmsscale;
+			float v3 = matmul_warppar(xs, L->w3, je, dim) * rmsscale;
+
+			float val = (args.act_gelu ? gelu(v1) : silu(v1)) * v3;
+
+			if (threadIdx.x % warpSize == 0) {
+				args.hb[j] = val;
+			}
+		}
+
+		syncgrid();
+		coopstage(args.perfstats, 5);
+
+		// self.w2(...) + pre-rmsnorm residual
+		for (int j = io; j < dim * args.n_experts_ac; j += ib) {
+			int je = (j % dim) + moe_experts[j / dim] * dim;
+			float val = matmul_warppar(args.hb + (j / dim) * hidden_dim, L->w2, je, hidden_dim);
+
+			if (threadIdx.x % warpSize == 0) {
+				atomicAdd(&args.x[j % dim], val * moe_weights[j / dim]);
+			}
+		}
+
+		__syncthreads(); // TODO: unclear why this is needed for determinism
+		syncgrid();
+		coopstage(args.perfstats, 6);
+	}
+}
+
+template <typename T, typename AT>
+__global__ static void kernel_output(uint64_t, float* xout, float* x, T* w, float* rms_weight, int n, int d, float norm_eps, bool norm_ln) {
+	extern __shared__ char smem[];
+
+	AT* xs = (AT*)smem;
+
+	float rmsscale = rmsnorm(xs, x, rms_weight, n, norm_eps, norm_ln);
+
+	int io = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+	int ib = (gridDim.x * blockDim.x) / warpSize;
+
+	for (int j = io; j < d; j += ib) {
+		float val = matmul_warppar(xs, w, j, n) * rmsscale;
+
+		// instead of writing one value per block, we transpose the values and write all results from first warp
+		val = blocktranspose(val, 0.f);
+
+		if (threadIdx.x < blockDim.x / warpSize) {
+			xout[j + threadIdx.x] = val;
+		}
+	}
+}
+
 __kernel void forward(__global const float *a,__global const float *b,__global float *result)
 {
     int gid = get_global_id(0);
     result[gid] = a[gid] + b[gid];
 }
+

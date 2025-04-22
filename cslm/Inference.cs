@@ -1,5 +1,6 @@
 using CommunityToolkit.HighPerformance;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -28,9 +29,13 @@ namespace cslm
 		{
 			Span<Half> r = MemoryMarshal.Cast<byte, Half>(w).Slice(i + n);
 			float val = 0.0f;
+			float c = 0.0f;
 			for (int j = 0; j < n; ++j)
 			{
-				val += (float)r[j] * x[j];
+				float y = (float)r[j] * x[j];
+				float t = val + y;
+				c = (t - val) - y;
+				val = t;
 			}
 			return val;
 		}
@@ -39,9 +44,13 @@ namespace cslm
 		{
 			Span<byte> r = w.Slice(i * n);
 			float val = 0.0f;
+			float c = 0.0f;
 			for (int j = 0; j < n; ++j)
 			{
-				val += (float)fp82half((byte)r[j]) * x[j];
+                float y = (float)fp82half((byte)r[j]) * x[j] - c;
+				float t = val + y;
+				c = (t - val) - y;
+				val = t;
 			}
 			return val;
 		}
@@ -50,12 +59,16 @@ namespace cslm
 		{
 			Span<uint> r = MemoryMarshal.Cast<byte, uint>(w).Slice(i * n / 8);
 			float val = 0.0f;
+			float c = 0.0f;
 			for (int j = 0; j < n; j += 8)
 			{
 				uint wg = r[j / 8];
 				for (int k = 0; k < 8; ++k)
 				{
-					val += gf4_ff(wg, k) * x[j + k];
+					float y = gf4_ff(wg, k) * x[j + k];
+					float t = val + y;
+					c = (t - val) - y;
+					val = t;
 				}
 			}
 			return val;
@@ -71,20 +84,31 @@ namespace cslm
 			// calculate mean
 			float mean = 0.0f;
 
-			if (ln)
+			float c;
+
+            if (ln)
 			{
+				c = 0.0f;
 				for (int i = 0; i < size; ++i)
 				{
-					mean += x[i];
-				}
-				mean /= size;
+					float y = x[i];
+                    float t = mean + y;
+                    c = (t - mean) - y;
+                    mean = t;
+
+                }
+                mean /= size;
 			}
 
 			// calculate sum of squared deltas
 			float ss = 0.0f;
+			c = 0.0f;
 			for (int i = 0; i < size; ++i)
 			{
-				ss += (x[i] - mean) * (x[i] - mean);
+                float y = (x[i] - mean) * (x[i] - mean);
+                float t = ss + y;
+                c = (t - ss) - y;
+                ss = t;
 			}
 
 			float var = ss / size;
@@ -321,8 +345,8 @@ namespace cslm
 
                 // key and value point to the kv cache
                 int loff = l * transformer.config_.seq_len_ * kv_dim; // kv cache layer offset for convenience
-				Span<kvtype_t> kb = MemoryMarshal.Cast<byte, kvtype_t>(transformer.state_.key_cache_.AsSpan()).Slice(loff);
-				Span<kvtype_t> vb = MemoryMarshal.Cast<byte, kvtype_t>(transformer.state_.value_cache_.AsSpan()).Slice(loff);
+				Span<kvtype_t> kb = transformer.state_.key_cache_.AsSpan().Slice(loff);
+				Span<kvtype_t> vb = transformer.state_.value_cache_.AsSpan().Slice(loff);
 
 				// update kv cache
 				for (int i = 0; i < kv_dim; ++i)

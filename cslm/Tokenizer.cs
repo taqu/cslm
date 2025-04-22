@@ -490,7 +490,7 @@ namespace cslm
 			return tokens.Count;
 		}
 
-#if DEBUG
+
 		public bool check_vocab()
 		{
 			ReadOnlySpan<byte> prev = new ReadOnlySpan<byte>();
@@ -520,7 +520,6 @@ namespace cslm
 			}
 			return true;
 		}
-#endif
-	}
+    }
 }
 
